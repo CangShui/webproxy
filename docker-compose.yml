@@ -1,0 +1,23 @@
+services:
+  # webproxy 反代服务：Caddy 已部署在宿主机上做 SSL 终止，
+  # 只把 127.0.0.1:17780 转发给本容器，不占用宿主机的 80/443。
+  webproxy:
+    image: ghcr.io/cangshui/webproxy:latest
+    container_name: webproxy
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:17780:8080"
+    command:
+      - -own-domain
+      - https://chatgpt.example.com
+      - -target
+      - https://chatgpt.com
+      - -listen
+      - :8080
+    # -tls 模式会把自签证书写到 /app/webproxy-cert.pem 和 /app/webproxy-key.pem，
+    # 挂载命名卷让证书在容器重建后仍然复用（不使用 -tls 时也可去掉）。
+    volumes:
+      - webproxy-data:/app
+
+volumes:
+  webproxy-data:

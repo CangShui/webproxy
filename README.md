@@ -100,6 +100,53 @@ webproxy -tls -own-domain https://example.com -target https://chatgpt.com -liste
 每次 GitHub Release 会自动构建容器镜像并推送到仓库自带的容器仓库
 （`ghcr.io/CangShui/webproxy`）。
 
+### Docker Compose（推荐，Caddy 做 SSL 终止）
+
+如果宿主机上已经部署 Caddy 处理 HTTPS，只需把 webproxy 放在 Caddy 后面，
+让它监听一个内网端口即可，不占用宿主机的 80/443。
+
+```yaml
+services:
+  webproxy:
+    image: ghcr.io/cangshui/webproxy:latest
+    container_name: webproxy
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:17780:8080"
+    command:
+      - -own-domain
+      - https://chatgpt.example.com
+      - -target
+      - https://chatgpt.com
+      - -listen
+      - :8080
+    volumes:
+      - webproxy-data:/app
+
+volumes:
+  webproxy-data:
+```
+
+Caddyfile 里加一条反代规则：
+
+```caddyfile
+chatgpt.example.com {
+    reverse_proxy 127.0.0.1:17780
+}
+```
+
+然后 `docker compose up -d` 启动，浏览器访问 `https://chatgpt.example.com/chatgpt.com/`。
+说明：
+
+- `-own-domain` 必须用 `https://` 公网地址，这样重写出来的 URL 才是 https，
+  避免混合内容被浏览器拦截
+- `-listen :8080` 对应镜像默认端口，`ports` 映射成宿主机回环地址
+  `127.0.0.1:17780`，只让 Caddy 访问
+- `webproxy-data:/app` 命名卷用于在 `-tls` 模式下持久化自签证书（不用 `-tls` 时可去掉）
+- 反代 ChatGPT 不需要 `-direct-domain`；只有反代 Claude 时才要加
+  `-direct-domain assets-proxy.anthropic.com`
+
+
 ```bash
 # 拉取最新镜像
 docker pull ghcr.io/cangshui/webproxy:latest
