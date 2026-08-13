@@ -169,6 +169,9 @@ docker run -d --name webproxy -p 443:443 -p 80:80 \
 - 路径前缀取自被反代的域名。目标站、它的子域名、同注册域名的兄弟子域名，
   以及其它任意外部域名都会被反代：`/claude.ai/...`、`/api.claude.ai/...`、
   `/assets-proxy.anthropic.com/...`。首段看起来像域名的路径会路由到该域名
+- `localhost`、回环地址（`127.0.0.1`、`::1`）和单标签主机名（如 `intranet`）
+  不会被反代，也不会被重写成代理路径，避免 `/localhost:3000/...` 这类上游
+  dev 回跳地址变成代理上的 404
   （像 `robots.txt`、`app.js` 这种文件型首段会回落到目标站）
 - 重定向保留查询参数，cookie 重新限定到你的域名（SPA 模式限定到根路径），
   Cloudflare 验证流程（`/?__cf_chl_rt_tk=...`、`/cdn-cgi/...`）可以正常通过
