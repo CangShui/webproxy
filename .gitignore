@@ -1,0 +1,20 @@
+# build artifacts
+/dist/
+*.exe
+*.exe~
+webproxy-linux-amd64
+
+# local test scaffolding
+/.pw/
+/backup-20260812/
+
+# self-signed certs and runtime logs (generated at startup)
+webproxy-cert.pem
+webproxy-key.pem
+*.log
+
+# editor/OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,7 @@
+.git
+.pw
+dist
+backup-20260812
+*.pem
+*.exe
+*.log
