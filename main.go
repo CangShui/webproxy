@@ -22,6 +22,7 @@ type Config struct {
 	ExtraDomains  []string // extra registrable domains to proxy, with subdomains (e.g. openai.com)
 	DirectDomains []string // hostnames never proxied; loaded from their real origin (e.g. sentinel.openai.com)
 	RootFallback  bool     // proxy unprefixed paths to the target (SPA mode)
+	UpstreamProxy *url.URL // optional socks5:// or http:// proxy for upstream fetches
 	TLS           bool     // serve HTTPS
 	CertFile      string   // TLS certificate file (PEM)
 	KeyFile       string   // TLS private key file (PEM)
@@ -37,10 +38,11 @@ func main() {
 	directDomain := flag.String("direct-domain", "", "comma-separated hostnames that must never be proxied (loaded straight from their real origin), e.g. hcaptcha.com if the CAPTCHA breaks")
 	tlsFlag := flag.Bool("tls", false, "serve HTTPS with a self-signed certificate (auto-generated and reused)")
 	certFile := flag.String("cert", "", "TLS certificate file (PEM); requires -key")
+	upstreamProxy := flag.String("upstream-proxy", "", "optional upstream proxy for fetching the target (socks5://host:port or http://host:port), useful when the server IP is blocked by the target's bot protection")
 	keyFile := flag.String("key", "", "TLS private key file (PEM); requires -cert")
 	flag.Parse()
 
-	cfg, err := parseConfig(*ownDomain, *target, *listen, *barePrefix, *rootFallback, *extraDomain, *directDomain, *tlsFlag, *certFile, *keyFile)
+	cfg, err := parseConfig(*ownDomain, *target, *listen, *barePrefix, *rootFallback, *extraDomain, *directDomain, *tlsFlag, *certFile, *keyFile, *upstreamProxy)
 	if err != nil {
 		log.Fatalf("invalid configuration: %v", err)
 	}
@@ -101,7 +103,7 @@ func main() {
 	}
 }
 
-func parseConfig(ownDomain, target, listen, barePrefix string, rootFallback bool, extraDomain, directDomain string, tlsFlag bool, certFile, keyFile string) (Config, error) {
+func parseConfig(ownDomain, target, listen, barePrefix string, rootFallback bool, extraDomain, directDomain string, tlsFlag bool, certFile, keyFile string, upstreamProxy string) (Config, error) {
 	var cfg Config
 	own, err := url.Parse(ownDomain)
 	if err != nil {
@@ -152,6 +154,21 @@ func parseConfig(ownDomain, target, listen, barePrefix string, rootFallback bool
 			return cfg, fmt.Errorf("direct-domain %q must be a bare hostname like sentinel.openai.com", d)
 		}
 		cfg.DirectDomains = append(cfg.DirectDomains, d)
+	}
+	if up := strings.TrimSpace(upstreamProxy); up != "" {
+		u, err := url.Parse(up)
+		if err != nil {
+			return cfg, fmt.Errorf("upstream-proxy: %w", err)
+		}
+		switch strings.ToLower(u.Scheme) {
+		case "socks5", "socks5h", "http", "https":
+		default:
+			return cfg, fmt.Errorf("upstream-proxy must use socks5:// or http://, got %q", u.Scheme)
+		}
+		if u.Host == "" {
+			return cfg, fmt.Errorf("upstream-proxy must include a host")
+		}
+		cfg.UpstreamProxy = u
 	}
 	cfg.TLS = tlsFlag || certFile != "" || keyFile != ""
 	if (certFile == "") != (keyFile == "") {

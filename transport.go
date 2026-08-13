@@ -1,17 +1,23 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
+	"golang.org/x/net/proxy"
 )
 
 // browserTransport mimics a real Chrome browser's TLS fingerprint (uTLS
@@ -25,12 +31,24 @@ type browserTransport struct {
 	pt http.RoundTripper // plain HTTP (no TLS) for http:// targets
 }
 
-func newBrowserTransport() http.RoundTripper {
+func newBrowserTransport(up *url.URL) http.RoundTripper {
 	bt := &browserTransport{}
+	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, addr)
+	}
+	dial := baseDial
+	if up != nil {
+		upstreamDial, err := upstreamDialer(up, baseDial)
+		if err != nil {
+			log.Printf("warning: upstream proxy %s unavailable (%v); falling back to direct connections", up.Redacted(), err)
+		} else {
+			dial = upstreamDial
+		}
+	}
 	bt.h2 = &http2.Transport{
 		DisableCompression: true,
 		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-			return dialUTLS(ctx, network, addr, utls.HelloChrome_131)
+			return dialUTLS(ctx, network, addr, utls.HelloChrome_131, dial)
 		},
 	}
 	bt.h1 = &http.Transport{
@@ -42,7 +60,7 @@ func newBrowserTransport() http.RoundTripper {
 		ResponseHeaderTimeout: 60 * time.Second,
 		ForceAttemptHTTP2:     false,
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return dialUTLSH1(ctx, network, addr)
+			return dialUTLSH1(ctx, network, addr, dial)
 		},
 	}
 	bt.pt = &http.Transport{
@@ -51,8 +69,126 @@ func newBrowserTransport() http.RoundTripper {
 		MaxIdleConnsPerHost:   100,
 		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: 60 * time.Second,
+		DialContext:           dial,
 	}
 	return &retryTransport{base: bt}
+}
+
+// dialContextFn establishes a raw TCP connection to network/addr.
+type dialContextFn func(ctx context.Context, network, addr string) (net.Conn, error)
+
+// upstreamDialer returns a dial function that routes connections through the
+// given proxy. Supported schemes:
+//
+//   - socks5:// and socks5h:// ? SOCKS5. The target hostname is sent to the
+//     proxy, so DNS is resolved by the proxy (remote DNS), which also avoids
+//     the local resolver leaking lookups.
+//   - http:// and https:// ? HTTP CONNECT, optionally with Basic auth in the
+//     URL userinfo (http://user:pass@host:port).
+//
+// Returns nil when up is nil.
+func upstreamDialer(up *url.URL, fallback dialContextFn) (dialContextFn, error) {
+	if up == nil {
+		return nil, nil
+	}
+	switch strings.ToLower(up.Scheme) {
+	case "socks5", "socks5h":
+		pd, err := proxy.SOCKS5("tcp", up.Host, socksAuth(up), dialerAdapter(fallback))
+		if err != nil {
+			return nil, err
+		}
+		if ctd, ok := pd.(proxy.ContextDialer); ok {
+			return ctd.DialContext, nil
+		}
+		return func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return pd.Dial(network, addr)
+		}, nil
+	case "http", "https":
+		return func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialHTTPConnect(ctx, up, addr, fallback)
+		}, nil
+	}
+	return nil, fmt.Errorf("unsupported proxy scheme %q", up.Scheme)
+}
+
+func socksAuth(up *url.URL) *proxy.Auth {
+	if up.User == nil {
+		return nil
+	}
+	auth := &proxy.Auth{User: up.User.Username()}
+	if pass, ok := up.User.Password(); ok {
+		auth.Password = pass
+	}
+	return auth
+}
+
+// dialerAdapter adapts a context dial function to x/net/proxy's Dialer
+// interface while keeping context-aware dialing through the proxy library.
+type dialerAdapter dialContextFn
+
+func (f dialerAdapter) Dial(network, addr string) (net.Conn, error) {
+	return f(context.Background(), network, addr)
+}
+
+func (f dialerAdapter) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return f(ctx, network, addr)
+}
+
+// dialHTTPConnect dials the target addr through an HTTP(S) proxy using the
+// CONNECT method, then returns the tunneled connection (keeping any bytes the
+// proxy already pipelined readable).
+func dialHTTPConnect(ctx context.Context, up *url.URL, addr string, fallback dialContextFn) (net.Conn, error) {
+	conn, err := fallback(ctx, "tcp", up.Host)
+	if err != nil {
+		return nil, err
+	}
+	if strings.EqualFold(up.Scheme, "https") {
+		tconn := tls.Client(conn, &tls.Config{ServerName: up.Hostname(), MinVersion: tls.VersionTLS12})
+		if err := tconn.HandshakeContext(ctx); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		conn = tconn
+	}
+	req := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{},
+		Host:   addr,
+		Header: make(http.Header),
+	}
+	if up.User != nil {
+		user := up.User.Username()
+		pass, _ := up.User.Password()
+		req.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(user+":"+pass)))
+	}
+	if err := req.Write(conn); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, req)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		conn.Close()
+		return nil, fmt.Errorf("proxy CONNECT to %s failed: %s", addr, resp.Status)
+	}
+	resp.Body.Close()
+	return &bufferedConn{Conn: conn, r: br}, nil
+}
+
+// bufferedConn keeps reading from the bufio.Reader after a CONNECT handshake
+// so bytes the proxy sent together with its response are not lost.
+type bufferedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *bufferedConn) Read(b []byte) (int, error) {
+	return c.r.Read(b)
 }
 
 func (t *browserTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -166,8 +302,8 @@ func isRetryable(err error) bool {
 	return false
 }
 
-func dialUTLS(ctx context.Context, network, addr string, id utls.ClientHelloID) (net.Conn, error) {
-	conn, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, addr)
+func dialUTLS(ctx context.Context, network, addr string, id utls.ClientHelloID, dial dialContextFn) (net.Conn, error) {
+	conn, err := dial(ctx, network, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -186,8 +322,8 @@ func dialUTLS(ctx context.Context, network, addr string, id utls.ClientHelloID) 
 
 // dialUTLSH1 dials with the Chrome fingerprint but only offers HTTP/1.1 in
 // ALPN, for upstreams that don't support HTTP/2.
-func dialUTLSH1(ctx context.Context, network, addr string) (net.Conn, error) {
-	conn, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, addr)
+func dialUTLSH1(ctx context.Context, network, addr string, dial dialContextFn) (net.Conn, error) {
+	conn, err := dial(ctx, network, addr)
 	if err != nil {
 		return nil, err
 	}

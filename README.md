@@ -60,6 +60,13 @@ webproxy -own-domain https://example.com -target https://claude.ai -listen :8080
 - `-tls` — 用自动生成的自签证书提供 HTTPS（证书保存在二进制旁边的
   `webproxy-cert.pem` / `webproxy-key.pem`，之后会复用）
 - `-cert` / `-key` — 使用你自己的 PEM 证书/私钥（必须成对提供，隐含 `-tls`）
+- `-upstream-proxy` — 可选的上游代理，所有到目标站的 TCP 连接都会走它，
+  格式 `socks5://host:port`、`socks5h://host:port`、`http://host:port` 或
+  `https://host:port`（HTTP 代理支持 `http://user:pass@host:port` 基础认证）。
+  适用场景：服务器自身 IP 被目标站的 Cloudflare / 机器人防护拦截（返回 403
+  验证页），而你的另一台机器出口正常——把那台机器作为上游代理出口即可。
+  SOCKS5 会把目标域名交给代理解析（远程 DNS），避免本地解析泄漏。uTLS
+  Chrome 指纹和 HTTP/1.1 协商仍然生效，协议升级（WebSocket）也能正常穿透。
 
 启动后打开 `https://example.com/claude.ai/` 即可访问。
 
@@ -220,3 +227,9 @@ docker run -d --name webproxy -p 443:443 -p 80:80 \
 - 无头 / 自动化浏览器（Playwright、Selenium、puppeteer）经常过不了
   Cloudflare / OpenAI 的机器人防护（`sec-ch-ua` 会暴露自动化特征）。
   这是上游行为，不是反代 bug，请使用普通浏览器
+
+- 服务器上网页能打开、但首页 / 登录接口返回 Cloudflare 403 验证页：
+  服务器 IP 被目标站防护拉黑。用一台出口干净的机器跑
+  `-upstream-proxy socks5://127.0.0.1:1080`，并通过 SSH 反向隧道
+  （`ssh -N -R 1080:127.0.0.1:1080`）把该机器的 SOCKS5 代理映射到服务器上，
+  所有上游请求就从干净出口出去了

@@ -85,7 +85,7 @@ func NewProxy(cfg Config) *Proxy {
 		registrable:    registrableDomain(cfg.Target.Hostname()),
 		maxBody:        64 << 20,
 	}
-	p.transport = newBrowserTransport()
+	p.transport = newBrowserTransport(p.cfg.UpstreamProxy)
 	return p
 }
 
