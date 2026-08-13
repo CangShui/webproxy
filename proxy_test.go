@@ -17,6 +17,86 @@ import (
 // upstream, so the path prefix is "<target host>:<port>". The proxy transport
 // dials the mock for every upstream connection so subdomains of the target
 // (e.g. api.127.0.0.1:<port>) can be exercised end to end.
+func TestServeReversePreservesRawPath(t *testing.T) {
+	var gotEscaped string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotEscaped = r.URL.EscapedPath()
+		w.Write([]byte("ok"))
+	}))
+	defer up.Close()
+
+	own, _ := url.Parse("http://localhost:8080")
+	tgt, _ := url.Parse(up.URL)
+	px := NewProxy(Config{OwnDomain: own, Target: tgt, Listen: ":8080"})
+
+	req := httptest.NewRequest("GET", "http://localhost:8080/chatgpt.com/cdn/assets/(_lang).images-cn0rkvyp.js", nil)
+	req.URL.RawPath = "/chatgpt.com/cdn/assets/(_lang).images-cn0rkvyp.js"
+	rec := httptest.NewRecorder()
+	target := &url.URL{Scheme: tgt.Scheme, Host: tgt.Host, Path: "/cdn/assets/(_lang).images-cn0rkvyp.js"}
+	px.serveReverse(rec, req, target, "", "/chatgpt.com/")
+
+	if gotEscaped != "/cdn/assets/(_lang).images-cn0rkvyp.js" {
+		t.Fatalf("upstream received %q, want raw parentheses preserved", gotEscaped)
+	}
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+}
+
+// TestServeReverseRawPathPrefixMismatch verifies the RawPath preservation does
+// not misfire when the handler target path is not the prefix suffix (e.g. the
+// sentinel route builds target.Path from the full request path while the
+// prefix is only used for context). The candidate must be validated against
+// the upstream path before it is applied.
+func TestServeReverseRawPathPrefixMismatch(t *testing.T) {
+	var gotEscaped string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotEscaped = r.URL.EscapedPath()
+		w.Write([]byte("ok"))
+	}))
+	defer up.Close()
+
+	own, _ := url.Parse("http://localhost:8080")
+	tgt, _ := url.Parse(up.URL)
+	px := NewProxy(Config{OwnDomain: own, Target: tgt, Listen: ":8080"})
+
+	req := httptest.NewRequest("GET", "http://localhost:8080/backend-api/sentinel/req", nil)
+	req.URL.RawPath = "/backend-api/sentinel/req"
+	rec := httptest.NewRecorder()
+	target := &url.URL{Scheme: tgt.Scheme, Host: tgt.Host, Path: "/backend-api/sentinel/req"}
+	px.serveReverse(rec, req, target, "", "/backend-api/sentinel/")
+
+	if gotEscaped != "/backend-api/sentinel/req" {
+		t.Fatalf("upstream received %q, want full sentinel path kept intact", gotEscaped)
+	}
+}
+
+// TestServeReversePreservesEncodedPath verifies an already-percent-encoded
+// request path keeps its exact encoding when forwarded (no double-encoding).
+func TestServeReversePreservesEncodedPath(t *testing.T) {
+	var gotEscaped string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotEscaped = r.URL.EscapedPath()
+		w.Write([]byte("ok"))
+	}))
+	defer up.Close()
+
+	own, _ := url.Parse("http://localhost:8080")
+	tgt, _ := url.Parse(up.URL)
+	px := NewProxy(Config{OwnDomain: own, Target: tgt, Listen: ":8080"})
+
+	raw := "/chatgpt.com/cdn/assets/%2Ffoo%20bar.js"
+	req := httptest.NewRequest("GET", "http://localhost:8080"+raw, nil)
+	req.URL.RawPath = raw
+	rec := httptest.NewRecorder()
+	target := &url.URL{Scheme: tgt.Scheme, Host: tgt.Host, Path: "/cdn/assets//foo bar.js"}
+	px.serveReverse(rec, req, target, "", "/chatgpt.com/")
+
+	if gotEscaped != "/cdn/assets/%2Ffoo%20bar.js" {
+		t.Fatalf("upstream received %q, want encoded path preserved", gotEscaped)
+	}
+}
+
 func TestUnrewriteRefererStrippedSPA(t *testing.T) {
 	own, _ := url.Parse("http://localhost:8080")
 	tgt, _ := url.Parse("https://chatgpt.com")
@@ -195,7 +275,7 @@ func TestProxyHTMLRewrite(t *testing.T) {
 	}
 	checks := []string{
 		`<base href="` + own.URL + `/` + prefix + `/">`,
-		`<script src="` + own.URL + `/` + prefix + `/app.js">`,
+		`<script src="/` + prefix + `/app.js">`,
 		`<link rel="stylesheet" href="` + own.URL + `/` + prefix + `/style.css">`,
 		`<img src="` + own.URL + `/api.` + prefix + `/v1/test.js">`,
 		`href="` + own.URL + `/` + prefix + `/v1/y"`,
@@ -380,8 +460,8 @@ func TestProxyStripForCatchAllHostPage(t *testing.T) {
 	}
 
 	// auth.openai.com is not a configured extra domain; it is proxied via the
-	// catch-all, and its pages must still get the SPA strip so the client-side
-	// router matches native routes (e.g. /log-in/password).
+	// catch-all. Its pages must keep the host prefix in the URL (no SPA strip
+	// script), so the page URL stays consistent with the injected <base> href.
 	status, h, body := get(t, own.URL+"/auth.openai.com/log-in/password")
 	if status != http.StatusOK {
 		t.Fatalf("GET auth page status = %d", status)
@@ -389,13 +469,13 @@ func TestProxyStripForCatchAllHostPage(t *testing.T) {
 	if got := h.Get("X-Upstream-Host"); got != "auth.openai.com" {
 		t.Fatalf("upstream host = %q, want auth.openai.com", got)
 	}
-	if !strings.Contains(body, `var P="/auth.openai.com"`) {
-		t.Errorf("strip script missing auth.openai.com prefix:\n%s", body)
+	if strings.Contains(body, "history.replaceState") {
+		t.Errorf("page must not strip the host prefix from the URL:\n%s", body)
 	}
-	if !strings.Contains(body, "history.replaceState") {
-		t.Errorf("strip script missing replaceState:\n%s", body)
+	if !strings.Contains(body, `<base href="`+own.URL+`/auth.openai.com/log-in/password">`) {
+		t.Errorf("base href missing host prefix:\n%s", body)
 	}
-	if !strings.Contains(body, `action="`+own.URL+`/auth.openai.com/log-in/password"`) {
+	if !strings.Contains(body, `action="/auth.openai.com/log-in/password"`) {
 		t.Errorf("form action not rewritten to host prefix:\n%s", body)
 	}
 }

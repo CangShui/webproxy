@@ -34,7 +34,7 @@ func TestRewriteFormURLInputs(t *testing.T) {
 <button name="redirect" value="https://claude.ai/btn">go</button>
 </form>
 </body></html>`
-	got := string(p.rewriteHTML([]byte(body), p.ownOrigin+"/claude.ai/", ""))
+	got := string(p.rewriteHTML([]byte(body), p.ownOrigin+"/claude.ai/"))
 	checks := []string{
 		`name="redirect_uri" value="http://localhost:8080/claude.ai/api/callback"`,
 		`name="state" value="abc123"`,
@@ -219,9 +219,9 @@ func testProxyExtra(t *testing.T) *Proxy {
 func TestRewriteURLPageHost(t *testing.T) {
 	p := testProxyExtra(t)
 	cases := []struct{ in, pageHost, want string }{
-		{"/log-in/password", "auth.openai.com", "http://localhost:8080/auth.openai.com/log-in/password"},
-		{"/style.css", "auth.openai.com", "http://localhost:8080/auth.openai.com/style.css"},
-		{"/log-in/password?x=1&y=2", "auth.openai.com", "http://localhost:8080/auth.openai.com/log-in/password?x=1&y=2"},
+		{"/log-in/password", "auth.openai.com", "/auth.openai.com/log-in/password"},
+		{"/style.css", "auth.openai.com", "/auth.openai.com/style.css"},
+		{"/log-in/password?x=1&y=2", "auth.openai.com", "/auth.openai.com/log-in/password?x=1&y=2"},
 		{"/auth.openai.com/x", "auth.openai.com", "/auth.openai.com/x"},
 		{"/openai.com/x", "auth.openai.com", "/openai.com/x"},
 		{"/claude.ai/x", "auth.openai.com", "/claude.ai/x"},
@@ -249,12 +249,12 @@ func TestRewriteHTMLExtraDomainFormAction(t *testing.T) {
 <a href="/log-in-or-create-account?usernameKind=email">Edit</a>
 </body></html>`
 	pageURL := "http://localhost:8080/auth.openai.com/log-in/password"
-	out := string(p.rewriteHTML([]byte(in), pageURL, ""))
+	out := string(p.rewriteHTML([]byte(in), pageURL))
 	checks := []string{
 		`<base href="http://localhost:8080/auth.openai.com/log-in/password">`,
-		`action="http://localhost:8080/auth.openai.com/log-in/password"`,
-		`src="http://localhost:8080/auth.openai.com/assets/logo.png"`,
-		`href="http://localhost:8080/auth.openai.com/log-in-or-create-account?usernameKind=email"`,
+		`action="/auth.openai.com/log-in/password"`,
+		`src="/auth.openai.com/assets/logo.png"`,
+		`href="/auth.openai.com/log-in-or-create-account?usernameKind=email"`,
 	}
 	for _, c := range checks {
 		if !strings.Contains(out, c) {
@@ -274,11 +274,11 @@ func TestRewriteHTMLPreservesReactRouterFormAction(t *testing.T) {
 </form>
 </body></html>`
 	pageURL := "http://localhost:8080/auth.openai.com/log-in/password"
-	out := string(p.rewriteHTML([]byte(in), pageURL, ""))
+	out := string(p.rewriteHTML([]byte(in), pageURL))
 	if !strings.Contains(out, `action="/log-in/password"`) {
 		t.Errorf("React Router form action was rewritten; want it left as-is\noutput:\n%s", out)
 	}
-	if !strings.Contains(out, `action="http://localhost:8080/auth.openai.com/plain"`) {
+	if !strings.Contains(out, `action="/auth.openai.com/plain"`) {
 		t.Errorf("plain form action not rewritten\noutput:\n%s", out)
 	}
 }
@@ -338,6 +338,14 @@ func TestRewriteLinkHeader(t *testing.T) {
 			"http://localhost:8080/claude.ai/login",
 			`<https://newassets.hcaptcha.com/1.11.0/hcaptcha.js>; rel=preload; as=script`,
 		},
+		{
+			// ChatGPT serves preload hints as root-relative URLs. They must be
+			// prefixed with the page's host prefix only - never with the full
+			// page URL (which used to produce a double prefix).
+			`</cdn/assets/root-f0d5xj6d.css>; rel=preload; as=style, </cdn/assets/04a8820c-ks5y25euu0qvjya9.js>; rel=modulepreload`,
+			"http://localhost:8080/chatgpt.com/images/",
+			`</chatgpt.com/cdn/assets/root-f0d5xj6d.css>; rel=preload; as=style, </chatgpt.com/cdn/assets/04a8820c-ks5y25euu0qvjya9.js>; rel=modulepreload`,
+		},
 	}
 	for _, c := range cases {
 		if got := p.rewriteLinkHeader(c.in, c.pageURL); got != c.want {
@@ -359,16 +367,16 @@ func TestRewriteHTML(t *testing.T) {
 <script>var u="https://claude.ai/api";</script>
 </body></html>`
 	pageURL := "http://localhost:8080/claude.ai/"
-	out := string(p.rewriteHTML([]byte(in), pageURL, ""))
+	out := string(p.rewriteHTML([]byte(in), pageURL))
 
 	checks := []string{
 		`<base href="http://localhost:8080/claude.ai/">`,
-		`<script src="http://localhost:8080/claude.ai/app.js">`,
+		`<script src="/claude.ai/app.js">`,
 		`<link rel="stylesheet" href="http://localhost:8080/claude.ai/style.css">`,
 		`<img src="http://localhost:8080/api.claude.ai/v1/test.js">`,
 		`href="http://localhost:8080/api.claude.ai/v1/y"`,
 		`href="rel.html"`,
-		`href="http://localhost:8080/claude.ai/docs"`,
+		`href="/claude.ai/docs"`,
 		`href="http://localhost:8080/example.com/z"`,
 		`var u="http://localhost:8080/claude.ai/api";`,
 	}
@@ -388,10 +396,28 @@ func TestRewriteHTML(t *testing.T) {
 	}
 }
 
+func TestRewriteRouterBasename(t *testing.T) {
+	p := testProxy(t)
+	ctx := `<script>window.__reactRouterContext = {"basename":"/","future":{"x":1},"routeDiscovery":{"manifestPath":"/__manifest"}};</script>`
+	in := `<html><head><title>x</title>` + ctx + `</head><body>hi</body></html>`
+	out := string(p.rewriteHTML([]byte(in), "http://localhost:8080/chatgpt.com/images/"))
+	if !strings.Contains(out, `"basename":"/chatgpt.com"`) {
+		t.Errorf("basename not rewritten to host prefix:\n%s", out)
+	}
+	if strings.Contains(out, `"basename":"/"`) {
+		t.Errorf("original basename still present:\n%s", out)
+	}
+	// pages served without a host prefix keep their basename
+	outRoot := string(p.rewriteHTML([]byte(in), "http://localhost:8080/"))
+	if !strings.Contains(outRoot, `"basename":"/"`) {
+		t.Errorf("root-fallback page must keep basename \"/\":\n%s", outRoot)
+	}
+}
+
 func TestRewriteHTMLExistingBase(t *testing.T) {
 	p := testProxy(t)
 	in := `<html><head><base href="https://claude.ai/"><title>x</title></head><body>ok</body></html>`
-	out := string(p.rewriteHTML([]byte(in), "http://localhost:8080/claude.ai/", ""))
+	out := string(p.rewriteHTML([]byte(in), "http://localhost:8080/claude.ai/"))
 	if !strings.Contains(out, `<base href="http://localhost:8080/claude.ai/">`) {
 		t.Errorf("existing base not rewritten:\n%s", out)
 	}
@@ -400,34 +426,33 @@ func TestRewriteHTMLExistingBase(t *testing.T) {
 	}
 }
 
-func TestRewriteHTMLInjectsStripScript(t *testing.T) {
+// TestRewriteHTMLKeepsPrefix verifies the runtime shim does NOT rewrite the
+// page URL by stripping the host prefix. The page URL and the injected <base>
+// href both carry the prefix; stripping one but not the other breaks relative
+// asset resolution and SPA routing.
+func TestRewriteHTMLKeepsPrefix(t *testing.T) {
 	p := testProxy(t)
 	in := `<html><head><title>x</title></head><body>hi</body></html>`
-	out := string(p.rewriteHTML([]byte(in), "http://localhost:8080/claude.ai/login", "/claude.ai"))
+	out := string(p.rewriteHTML([]byte(in), "http://localhost:8080/claude.ai/login"))
 	if !strings.Contains(out, `<base href="http://localhost:8080/claude.ai/login">`) {
 		t.Errorf("base missing:\n%s", out)
 	}
-	if !strings.Contains(out, `var P="/claude.ai"`) {
-		t.Errorf("strip script missing prefix:\n%s", out)
+	if !strings.Contains(out, "proxifyHist") {
+		t.Errorf("runtime shim missing:\n%s", out)
 	}
-	if !strings.Contains(out, "history.replaceState") {
-		t.Errorf("strip script missing replaceState:\n%s", out)
-	}
-	// without stripPrefix no shim is injected
-	out2 := string(p.rewriteHTML([]byte(in), "http://localhost:8080/claude.ai/login", ""))
-	if strings.Contains(out2, "history.replaceState") {
-		t.Errorf("strip script should not be injected when stripPrefix is empty:\n%s", out2)
+	if strings.Contains(out, "history.replaceState") {
+		t.Errorf("shim must not strip the host prefix:\n%s", out)
 	}
 }
 
 func TestRewriteHTMLDropsIntegrity(t *testing.T) {
 	p := testProxy(t)
 	in := `<html><head></head><body><script src="/x.js" integrity="sha256-abc" crossorigin="anonymous"></script></body></html>`
-	out := string(p.rewriteHTML([]byte(in), "http://localhost:8080/claude.ai/", ""))
+	out := string(p.rewriteHTML([]byte(in), "http://localhost:8080/claude.ai/"))
 	if strings.Contains(out, "integrity") {
 		t.Errorf("integrity attribute should be removed:\n%s", out)
 	}
-	if !strings.Contains(out, `src="http://localhost:8080/claude.ai/x.js"`) {
+	if !strings.Contains(out, `src="/claude.ai/x.js"`) {
 		t.Errorf("script src not rewritten:\n%s", out)
 	}
 	if !strings.Contains(out, `crossorigin="anonymous"`) {
@@ -663,6 +688,26 @@ func TestRewriteSetCookie(t *testing.T) {
 	}
 }
 
+// TestShimReactRouterManifest verifies the runtime shim rewrites asset paths
+// (module/css/imports) inside the react-router manifest so lazy route modules
+// load through the proxy prefix. Without this, client-side navigation to lazy
+// routes imports an unprefixed /cdn/... URL, fails, and react-router falls
+// back to a full page reload.
+func TestShimReactRouterManifest(t *testing.T) {
+	p := testProxyExtra(t)
+	shim := p.runtimeShimScript()
+	for _, want := range []string{
+		`Object.defineProperty(window,"__reactRouterManifest"`,
+		`o.module=rrP(o.module)`,
+		`o.css[ci]=rrP(o.css[ci])`,
+		`o.imports[ii]=rrP(o.imports[ii])`,
+	} {
+		if !strings.Contains(shim, want) {
+			t.Errorf("shim missing %q", want)
+		}
+	}
+}
+
 // TestShimClickRewriteInPlace verifies the runtime shim rewrites an anchor's
 // href attribute in place on click instead of force-navigating. SPA links
 // (e.g. ChatGPT conversation list) must keep their client-side navigation;
@@ -700,6 +745,31 @@ func TestShimClickRewriteInPlace(t *testing.T) {
 // the real world such a jump is cross-origin and always loads a new document;
 // on the proxy domain both hosts share one origin, so without this the SPA
 // would just change the URL and render its own fallback.
+// TestShimHistoryPrefixPreservation verifies the history shim resolves URLs
+// against the document URL (as the native History API does) and re-adds the
+// page-host prefix when the SPA passes a root-relative URL. SPAs assume they
+// are served at the origin root, so history.replaceState("/") would otherwise
+// drop the "/target.com" prefix and break every relative asset URL.
+func TestShimHistoryPrefixPreservation(t *testing.T) {
+	p := testProxyExtra(t)
+	shim := p.runtimeShimScript()
+	for _, want := range []string{
+		"function proxifyHist(u)",
+		"var a=new URL(u,location.href)",
+		`h.pushState=function(s,t,u){if(typeof u==="string"){var p=proxifyHist(u)`,
+		`h.replaceState=function(s,t,u){if(typeof u==="string"){var p=proxifyHist(u)`,
+		`if(ph){return rewriteParams(OWN+"/"+ph+pth+a.search+a.hash);}`,
+	} {
+		if !strings.Contains(shim, want) {
+			t.Errorf("shim missing %q", want)
+		}
+	}
+	// The history wrappers must use proxifyHist, not the base-relative proxify.
+	if strings.Contains(shim, `h.pushState=function(s,t,u){if(typeof u==="string"){var p=proxify(u)`) {
+		t.Errorf("pushState wrapper still uses base-relative proxify")
+	}
+}
+
 func TestShimCrossHostNavigation(t *testing.T) {
 	p := testProxyExtra(t)
 	shim := p.runtimeShimScript()

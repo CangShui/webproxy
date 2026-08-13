@@ -5,7 +5,6 @@ import (
 	"net"
 	"net/url"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"golang.org/x/net/html"
@@ -329,6 +328,16 @@ func (p *Proxy) rewriteURLIn(raw, pageHost string) string {
 		if host == "" {
 			host = p.targetHost
 		}
+		if pageHost != "" {
+			// Pages served under a host prefix: emit the prefix as a
+			// root-relative path (/chatgpt.com/images) instead of an
+			// absolute URL. Both resolve to the same URL against the own
+			// origin, but the root-relative form matches what an SPA router
+			// with basename /chatgpt.com renders after hydration, so the
+			// router intercepts link clicks and navigates client-side
+			// instead of triggering a full page reload.
+			return p.rewriteURLParams("/" + host + uriOf(u))
+		}
 		return p.rewriteURLParams(p.ownOrigin + "/" + host + uriOf(u))
 	}
 	return raw
@@ -345,12 +354,11 @@ func uriOf(u *url.URL) string {
 	return s
 }
 
-// rewriteHTML rewrites URLs inside an HTML document and injects a <base> tag so
-// that root-relative and relative URLs resolve through the proxy. pageURL is
-// the proxied URL of the current document. stripPrefix, when non-empty, is the
-// path prefix to remove from the page URL at runtime (SPA mode), so client-side
-// routers see the target's native paths.
-func (p *Proxy) rewriteHTML(body []byte, pageURL, stripPrefix string) []byte {
+// rewriteHTML rewrites URLs inside an HTML document and injects a <base> tag
+// so that root-relative and relative URLs resolve through the proxy. pageURL
+// is the proxied URL of the current document; the page URL and the base href
+// both carry the host prefix, keeping the app's own-origin assumption intact.
+func (p *Proxy) rewriteHTML(body []byte, pageURL string) []byte {
 	pageHost := p.pageHostOf(pageURL)
 	z := html.NewTokenizer(bytes.NewReader(body))
 	var out bytes.Buffer
@@ -376,12 +384,6 @@ func (p *Proxy) rewriteHTML(body []byte, pageURL, stripPrefix string) []byte {
 		var injected string
 		if !sawBase && pageURL != "" {
 			injected += `<base href="` + html.EscapeString(pageURL) + `">`
-		}
-		if stripPrefix != "" {
-			// Strip before the runtime shim installs its history hooks, so
-			// client-side routers see the target's native paths and can
-			// intercept form submissions (which attach the sentinel headers).
-			injected += `<script>` + spaStripScript(stripPrefix) + `</script>`
 		}
 		injected += `<script>` + p.runtimeShimScript() + `</script>`
 		if injected != "" {
@@ -530,19 +532,34 @@ func (p *Proxy) rewriteHTML(body []byte, pageURL, stripPrefix string) []byte {
 				data = []byte(p.rewriteCSSIn(string(data), pageHost))
 			} else if inScript {
 				data = p.rewriteAbsURLs(data)
+				if pageHost != "" {
+					data = rewriteRouterBasename(data, pageHost)
+				}
 			}
 			write(data)
 		}
 	}
 }
 
-// spaStripScript returns a tiny script that rewrites the current history entry
-// by removing the proxy path prefix, so SPA routers match the target's native
-// routes. Future navigations and reloads work because unprefixed paths are
-// served by the root fallback.
-func spaStripScript(prefix string) string {
-	js := `!function(){try{var P=__P__;var p=location.pathname;if(P!=="/"&&p.indexOf(P)===0){var n=p.slice(P.length);if(!n)n="/";if(n[0]!=="/")n="/"+n;history.replaceState(history.state,"",n+location.search+location.hash)}}catch(e){}}();`
-	return strings.ReplaceAll(js, "__P__", strconv.Quote(prefix))
+// reactRouterBasenameRe matches the basename field of a React Router v7 SSR
+// context (window.__reactRouterContext). The client router mounts at this
+// basename, so rewriting "/" to the proxied host prefix makes the app's
+// routes match the prefixed location.pathname natively: at
+// https://own/chatgpt.com/images with basename /chatgpt.com the router
+// matches route /images. Hydration then succeeds and client-side navigation
+// works without full-page reloads. [^{}]* keeps the match inside the context
+// object so ordinary JSON elsewhere is untouched.
+var reactRouterBasenameRe = regexp.MustCompile(`(window\.__reactRouterContext\s*=\s*\{[^{}]*"basename"\s*:\s*")/"`)
+
+// rewriteRouterBasename rewrites a React Router basename to the proxied host
+// prefix (pageHost) so SPA routing works under /host/... URLs. Pages served
+// without a host prefix (root fallback) keep their original basename.
+func rewriteRouterBasename(data []byte, pageHost string) []byte {
+	if pageHost == "" {
+		return data
+	}
+	escaped := strings.ReplaceAll(strings.ReplaceAll(pageHost, `\`, `\\`), `"`, `\"`)
+	return reactRouterBasenameRe.ReplaceAll(data, []byte(`$1/`+escaped+`"`))
 }
 
 func endTagName(raw []byte) string {

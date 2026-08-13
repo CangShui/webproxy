@@ -388,9 +388,13 @@ var linkHeaderURLRe = regexp.MustCompile(`<([^>]*)>`)
 // preload/preconnect hints point at the proxy domain instead of leaking
 // direct requests to real origins.
 func (p *Proxy) rewriteLinkHeader(v, pageURL string) string {
+	// rewriteURLIn expects the host prefix of the current page (e.g.
+	// "chatgpt.com"), not the full page URL: feeding it the page URL would
+	// insert the whole /host/path/ segment into every rewritten Link URL.
+	pageHost := p.pageHostOf(pageURL)
 	return linkHeaderURLRe.ReplaceAllStringFunc(v, func(m string) string {
 		inner := strings.TrimSpace(m[1 : len(m)-1])
-		return "<" + p.rewriteURLIn(inner, pageURL) + ">"
+		return "<" + p.rewriteURLIn(inner, pageHost) + ">"
 	})
 }
 
@@ -544,7 +548,7 @@ func (p *Proxy) serveSentinelFrame(w http.ResponseWriter, r *http.Request) {
 	body := []byte("<!DOCTYPE html><html><body><script src='" + src + "'></script></body></html>")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Del("Content-Security-Policy")
-	out := p.rewriteHTML(body, p.pageURL(r), "")
+	out := p.rewriteHTML(body, p.pageURL(r))
 	w.Header().Set("Content-Length", strconv.Itoa(len(out)))
 	w.WriteHeader(http.StatusOK)
 	w.Write(out)
@@ -556,6 +560,27 @@ func (p *Proxy) serveReverse(w http.ResponseWriter, r *http.Request, target *url
 		if s := p.unrewriteURLParams(u.String()); s != u.String() {
 			if nu, err := url.Parse(s); err == nil {
 				u = *nu
+			}
+		}
+		// Preserve the client's original path escaping. Go re-encodes URL
+		// characters such as parentheses ( -> %28) when it serializes a
+		// freshly built URL, but Cloudflare rejects the encoded form with
+		// 403 "Invalid URL" on routes like /cdn/assets/(_lang).js. Forward
+		// the browser's exact escaped path so special characters stay
+		// byte-for-byte identical. The candidate is only used when it is a
+		// valid encoding of the upstream path (prefix stripping only applies
+		// to handlers whose target path is the prefix suffix).
+		if r.URL.RawPath != "" {
+			raw := r.URL.EscapedPath()
+			esc := raw
+			switch {
+			case pathPrefix != "" && strings.HasPrefix(raw, pathPrefix):
+				esc = "/" + strings.TrimPrefix(raw[len(pathPrefix):], "/")
+			case strings.HasPrefix(raw, "/"):
+				esc = raw
+			}
+			if dec, err := url.PathUnescape(esc); err == nil && dec == u.Path {
+				u.RawPath = esc
 			}
 		}
 		req.URL = &u
@@ -653,24 +678,11 @@ func (p *Proxy) modifyResponse(resp *http.Response) {
 	}
 
 	pageURL, _ := ctxString(resp, ctxKeyPageURL)
-	stripPrefix := ""
-	if p.cfg.RootFallback {
-		// Strip the host prefix for any proxied host page (target or extra
-		// domain, e.g. auth.openai.com) so client-side routers match the
-		// target's native routes and can intercept form submissions. Bare
-		// prefixes like /cdn-cgi/ or /backend-api/sentinel/ are not host
-		// prefixes and keep their path.
-		if prefix, ok := ctxString(resp, ctxKeyPrefix); ok {
-			if host := strings.TrimSuffix(strings.TrimPrefix(prefix, "/"), "/"); host != "" && p.isProxiedHostPrefix(host) {
-				stripPrefix = "/" + host
-			}
-		}
-	}
 	body := resp.Body
 	transform := func(data []byte) []byte {
 		switch {
 		case strings.Contains(ct, "html"):
-			return p.rewriteHTML(data, pageURL, stripPrefix)
+			return p.rewriteHTML(data, pageURL)
 		case strings.Contains(ct, "css"):
 			return []byte(p.rewriteCSS(string(data)))
 		default: // javascript / json
