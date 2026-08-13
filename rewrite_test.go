@@ -663,6 +663,37 @@ func TestRewriteSetCookie(t *testing.T) {
 	}
 }
 
+// TestShimClickRewriteInPlace verifies the runtime shim rewrites an anchor's
+// href attribute in place on click instead of force-navigating. SPA links
+// (e.g. ChatGPT conversation list) must keep their client-side navigation;
+// hijacking them with window.location.href turns every click into a full page
+// reload. Plain links still navigate normally because default is not prevented.
+func TestShimClickRewriteInPlace(t *testing.T) {
+	p := testProxyExtra(t)
+	shim := p.runtimeShimScript()
+	i := strings.Index(shim, `document.addEventListener("click"`)
+	if i < 0 {
+		t.Fatal("click handler not found in shim")
+	}
+	click := shim[i:]
+	for _, want := range []string{
+		`a.setAttribute("href",p)`,
+	} {
+		if !strings.Contains(click, want) {
+			t.Errorf("click handler missing %q", want)
+		}
+	}
+	for _, bad := range []string{
+		`e.preventDefault();`,
+		`window.location.href=p;`,
+		`window.open(p);`,
+	} {
+		if strings.Contains(click, bad) {
+			t.Errorf("click handler must not %q", bad)
+		}
+	}
+}
+
 // TestShimCrossHostNavigation verifies the runtime shim converts a client-side
 // history navigation that crosses proxied hosts (e.g. auth.openai.com page
 // pushing the chatgpt.com callback URL) into a real full-page navigation. In
