@@ -29,6 +29,22 @@ const (
 // widget is designed to run cross-origin.
 var defaultDirectDomains = []string{"hcaptcha.com"}
 
+// defaultNamespaceHosts are hosts whose URLs are URI identifiers or pure
+// documentation, not resources the site loads: XML namespace URIs
+// (http://www.w3.org/2000/svg), schema URIs, spec references and error-doc
+// links (React's https://react.dev/errors/...). Rewriting them inside JS
+// breaks code that compares strings against the literal URI - React's SVG
+// handling crashed when createElementNS received a rewritten xmlns value -
+// and produces useless /host/ paths, so they are excluded for every target.
+var defaultNamespaceHosts = []string{
+	"w3.org",
+	"schema.org",
+	"react.dev",
+	"whatwg.org",
+	"ietf.org",
+	"developer.mozilla.org",
+}
+
 // sentinelHost is the bot-protection host OpenAI sites use for their
 // Sentinel anti-bot frame/SDK. It is routed (and its URLs rewritten) through
 // the proxy like any other proxied host, so the frame's /backend-api/sentinel/
@@ -53,6 +69,9 @@ type Proxy struct {
 }
 
 func NewProxy(cfg Config) *Proxy {
+	direct := append([]string{}, cfg.DirectDomains...)
+	direct = append(direct, defaultDirectDomains...)
+	direct = append(direct, defaultNamespaceHosts...)
 	p := &Proxy{
 		cfg:            cfg,
 		ownOrigin:      cfg.OwnDomain.Scheme + "://" + cfg.OwnDomain.Host,
@@ -62,7 +81,7 @@ func NewProxy(cfg Config) *Proxy {
 		targetScheme:   cfg.Target.Scheme,
 		barePrefixes:   cfg.BarePrefixes,
 		extraDomains:   cfg.ExtraDomains,
-		directDomains:  append(append([]string{}, cfg.DirectDomains...), defaultDirectDomains...),
+		directDomains:  direct,
 		registrable:    registrableDomain(cfg.Target.Hostname()),
 		maxBody:        64 << 20,
 	}
@@ -90,7 +109,31 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Client apps sometimes re-prefix an already-proxied absolute URL with the
+	// origin, producing paths like /https://own/host/path (the embedded URL
+	// may itself already carry the host prefix). Recover the canonical path
+	// instead of 404ing on the "https:" segment.
+	if np, ok := p.normalizePath(path); ok {
+		path = np
+		r.URL.Path = np
+		if r.URL.RawPath != "" {
+			r.URL.RawPath = ""
+		}
+	}
+
 	host, rest := splitPathPrefix(path)
+
+	// Same family of app bugs: /host//cdn/x - a host prefix followed by a
+	// double slash (apps concatenate origins with absolute URLs). Collapse it
+	// so the upstream receives the canonical path.
+	if strings.HasPrefix(rest, "//") && p.isProxiedHostPrefix(host) {
+		rest = collapsePathSlashes(rest)
+		path = "/" + host + rest
+		r.URL.Path = path
+		if r.URL.RawPath != "" {
+			r.URL.RawPath = ""
+		}
+	}
 
 	// The Sentinel SDK computes its frame/API URLs from the script origin
 	// ("origin + /backend-api/sentinel/"), which becomes a host-prefix-less
@@ -424,6 +467,66 @@ func splitPathPrefix(path string) (host, rest string) {
 	return p, ""
 }
 
+// embeddedURLPathRe matches request paths that embed an absolute URL as their
+// first path segment, e.g. /https://host/path. Some client apps concatenate
+// the origin with an already-absolute URL, producing both the plain
+// /https://api.example.com/v1/x form and the re-prefixed
+// /https://own-host/host-prefix//cdn/x form.
+var embeddedURLPathRe = regexp.MustCompile("(?i)^/(https?://.*)$")
+
+// normalizePath recovers the canonical proxied path from a path that embeds
+// an absolute URL as its first segment. Embedded URLs on the own domain keep
+// their inner path (which may itself carry a host prefix); external hosts get
+// the standard /host/path form. Duplicate slashes are collapsed in both
+// cases. It returns the canonical path and true when a rewrite happened.
+func (p *Proxy) normalizePath(path string) (string, bool) {
+	m := embeddedURLPathRe.FindStringSubmatch(path)
+	if m == nil {
+		return "", false
+	}
+	u, err := url.Parse(m[1])
+	if err != nil || u.Host == "" {
+		return "", false
+	}
+	upath := u.Path
+	if upath == "" {
+		upath = "/"
+	}
+	upath = collapsePathSlashes(upath)
+	if strings.EqualFold(u.Hostname(), p.ownHost) {
+		return upath, true
+	}
+	if !p.shouldProxyHost(u.Host) {
+		return "", false
+	}
+	return "/" + u.Host + upath, true
+}
+
+// collapsePathSlashes collapses runs of duplicate "/" in a URL path, so paths
+// like /host//cdn/x (produced by apps that concatenate origins with absolute
+// URLs) route correctly.
+func collapsePathSlashes(path string) string {
+	if !strings.Contains(path, "//") {
+		return path
+	}
+	var b strings.Builder
+	b.Grow(len(path))
+	prevSlash := false
+	for i := 0; i < len(path); i++ {
+		c := path[i]
+		if c == '/' {
+			if prevSlash {
+				continue
+			}
+			prevSlash = true
+		} else {
+			prevSlash = false
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
 // serveSentinelFrame serves a synthetic sentinel frame document. The real
 // frame.html is a static one-liner that loads the versioned SDK; fetching it
 // from the upstream through Go is blocked by Cloudflare (404/403), so we
@@ -558,7 +661,7 @@ func (p *Proxy) modifyResponse(resp *http.Response) {
 		// prefixes like /cdn-cgi/ or /backend-api/sentinel/ are not host
 		// prefixes and keep their path.
 		if prefix, ok := ctxString(resp, ctxKeyPrefix); ok {
-			if host := strings.TrimSuffix(strings.TrimPrefix(prefix, "/"), "/"); host != "" && p.isProxyHost(host) {
+			if host := strings.TrimSuffix(strings.TrimPrefix(prefix, "/"), "/"); host != "" && p.isProxiedHostPrefix(host) {
 				stripPrefix = "/" + host
 			}
 		}

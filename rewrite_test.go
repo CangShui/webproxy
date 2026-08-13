@@ -474,6 +474,87 @@ func TestRewriteAbsURLs(t *testing.T) {
 	}
 }
 
+func TestRewriteAbsURLsPreservesNamespaceURI(t *testing.T) {
+	p := testProxy(t)
+	in := `createElementNS("http://www.w3.org/2000/svg", n); var u="https://schema.org/Thing"; var d="https://react.dev/errors/418"; var m="https://developer.mozilla.org/en-US/docs/Web"; fetch("https://example.com/x");`
+	out := string(p.rewriteAbsURLs([]byte(in)))
+	for _, keep := range []string{
+		`"http://www.w3.org/2000/svg"`,
+		`"https://schema.org/Thing"`,
+		`"https://react.dev/errors/418"`,
+		`"https://developer.mozilla.org/en-US/docs/Web"`,
+	} {
+		if !strings.Contains(out, keep) {
+			t.Errorf("namespace/doc URL %s should stay untouched:\n%s", keep, out)
+		}
+	}
+	// ordinary external hosts are still rewritten
+	if !strings.Contains(out, `"http://localhost:8080/example.com/x"`) {
+		t.Errorf("ordinary host should still be rewritten:\n%s", out)
+	}
+}
+
+func TestDefaultNamespaceHosts(t *testing.T) {
+	p := testProxy(t)
+	for _, host := range []string{"www.w3.org", "w3.org", "schema.org", "react.dev", "developer.mozilla.org", "html.spec.whatwg.org"} {
+		if p.shouldProxyHost(host) {
+			t.Errorf("shouldProxyHost(%q) = true, want false (namespace/doc host)", host)
+		}
+	}
+	for _, host := range []string{"assets-proxy.anthropic.com", "example.com", "auth.openai.com"} {
+		if !p.shouldProxyHost(host) {
+			t.Errorf("shouldProxyHost(%q) = false, want true", host)
+		}
+	}
+	if got := p.rewriteURL("http://www.w3.org/2000/svg"); got != "http://www.w3.org/2000/svg" {
+		t.Errorf("rewriteURL(w3.org) = %q, want unchanged", got)
+	}
+}
+
+func TestNormalizePath(t *testing.T) {
+	own, _ := url.Parse("http://localhost:8080")
+	tgt, _ := url.Parse("https://chatgpt.com")
+	p := NewProxy(Config{OwnDomain: own, Target: tgt, RootFallback: true})
+	cases := []struct {
+		in, want string
+		rewrite  bool
+	}{
+		{"/https://localhost:8080/chatgpt.com//cdn/assets/x.css", "/chatgpt.com/cdn/assets/x.css", true},
+		{"/https://localhost:8080/cdn/assets/x.css", "/cdn/assets/x.css", true},
+		{"/https://api.example.com/v1/test.js", "/api.example.com/v1/test.js", true},
+		{"/http://api.example.com//v1/t.js", "/api.example.com/v1/t.js", true},
+		{"/https://example.com", "/example.com/", true},
+		{"/chatgpt.com/cdn/assets/x.css", "", false},
+		{"/cdn/assets/x.css", "", false},
+		{"/https://hcaptcha.com/x", "", false}, // direct domain stays unnormalized
+	}
+	for _, c := range cases {
+		got, ok := p.normalizePath(c.in)
+		if ok != c.rewrite {
+			t.Errorf("normalizePath(%q) ok = %v, want %v", c.in, ok, c.rewrite)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("normalizePath(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestCollapsePathSlashes(t *testing.T) {
+	cases := map[string]string{
+		"/chatgpt.com//cdn/x": "/chatgpt.com/cdn/x",
+		"//cdn/assets/x":      "/cdn/assets/x",
+		"/a/b/c":              "/a/b/c",
+		"/a//b///c":           "/a/b/c",
+		"/":                   "/",
+		"":                    "",
+	}
+	for in, want := range cases {
+		if got := collapsePathSlashes(in); got != want {
+			t.Errorf("collapsePathSlashes(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
 func TestRewriteAbsURLsPreservesRegexLiteral(t *testing.T) {
 	p := testProxy(t)
 	in := `/^https?:\/\//.test(t) ? window.location.replace(t) : s.replace(t); var u="https://claude.ai/x";`

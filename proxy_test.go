@@ -320,6 +320,85 @@ func TestProxyRootFallbackDisabled404(t *testing.T) {
 	}
 }
 
+func TestProxyEmbeddedAbsoluteURLPath(t *testing.T) {
+	own, prefix := newTestStack(t)
+	// App re-prefixed an already-proxied URL with the origin:
+	// /https://own/<host-prefix>//v1/test.js
+	ownHost := strings.TrimPrefix(own.URL, "http://")
+	status, h, body := get(t, own.URL+"/https://"+ownHost+"/"+prefix+"//v1/test.js")
+	if status != http.StatusOK {
+		t.Fatalf("GET embedded-own status = %d, want 200 (body: %.100s)", status, body)
+	}
+	if got := h.Get("X-Upstream-Path"); got != "/v1/test.js" {
+		t.Fatalf("upstream path = %q, want /v1/test.js", got)
+	}
+	// Embedded external host form: /https://example.com/v1/test.js
+	status, h, _ = get(t, own.URL+"/https://example.com/v1/test.js")
+	if status != http.StatusOK {
+		t.Fatalf("GET embedded-external status = %d, want 200", status)
+	}
+	if got := h.Get("X-Upstream-Host"); got != "example.com" {
+		t.Fatalf("upstream host = %q, want example.com", got)
+	}
+	if got := h.Get("X-Upstream-Path"); got != "/v1/test.js" {
+		t.Fatalf("upstream path = %q, want /v1/test.js", got)
+	}
+}
+
+func TestProxyHostPrefixDoubleSlash(t *testing.T) {
+	own, prefix := newTestStack(t)
+	status, h, _ := get(t, own.URL+"/"+prefix+"//v1/test.js")
+	if status != http.StatusOK {
+		t.Fatalf("GET double-slash status = %d, want 200", status)
+	}
+	if got := h.Get("X-Upstream-Path"); got != "/v1/test.js" {
+		t.Fatalf("upstream path = %q, want /v1/test.js", got)
+	}
+}
+
+func TestProxyStripForCatchAllHostPage(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Upstream-Host", r.Host)
+		w.Header().Set("X-Upstream-Path", r.URL.Path)
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<html><head><title>auth</title></head><body><form action="/log-in/password" method="post"><input name="x"></form></body></html>`)
+	}))
+	defer target.Close()
+	prefix := target.Listener.Addr().String()
+
+	var proxy *Proxy
+	own := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxy.ServeHTTP(w, r)
+	}))
+	defer own.Close()
+	ownURL, _ := url.Parse(own.URL)
+	tgtURL, _ := url.Parse(target.URL)
+	proxy = NewProxy(Config{OwnDomain: ownURL, Target: tgtURL, RootFallback: true})
+	proxyPlainTransport(proxy).DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, network, prefix)
+	}
+
+	// auth.openai.com is not a configured extra domain; it is proxied via the
+	// catch-all, and its pages must still get the SPA strip so the client-side
+	// router matches native routes (e.g. /log-in/password).
+	status, h, body := get(t, own.URL+"/auth.openai.com/log-in/password")
+	if status != http.StatusOK {
+		t.Fatalf("GET auth page status = %d", status)
+	}
+	if got := h.Get("X-Upstream-Host"); got != "auth.openai.com" {
+		t.Fatalf("upstream host = %q, want auth.openai.com", got)
+	}
+	if !strings.Contains(body, `var P="/auth.openai.com"`) {
+		t.Errorf("strip script missing auth.openai.com prefix:\n%s", body)
+	}
+	if !strings.Contains(body, "history.replaceState") {
+		t.Errorf("strip script missing replaceState:\n%s", body)
+	}
+	if !strings.Contains(body, `action="`+own.URL+`/auth.openai.com/log-in/password"`) {
+		t.Errorf("form action not rewritten to host prefix:\n%s", body)
+	}
+}
 func TestProxyExtraDomainEndToEnd(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Upstream-Host", r.Host)

@@ -49,6 +49,9 @@ webproxy -own-domain https://example.com -target https://claude.ai -listen :8080
 - `-direct-domain` — 逗号分隔的、**必须直连真实源站**的域名列表。
   只对确实无法反代的域名使用（例如脚本有来源校验、CDN 拒绝服务端请求）。
   `hcaptcha.com` 已默认直连，因为反代会弄坏验证码。
+  另外 `w3.org`、`schema.org`、`react.dev` 等命名空间/文档类域名也默认直连：
+  它们里面的 URL 是 URI 标识符（如 `http://www.w3.org/2000/svg`），重写会破坏
+  React 的 SVG 命名空间处理导致页面崩溃，直连才是正确行为。
   注意：**不要**把 `sentinel.openai.com` 加进去，它的反爬 frame 是有意反代
   合成的，保证 `/backend-api/sentinel/req` 的请求留在你自己域名上。
 - `-root-fallback` — 把没有路径前缀的路径反代到目标站（SPA 模式，默认 `true`）。
