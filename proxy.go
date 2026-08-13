@@ -132,6 +132,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !p.isProxiedHostPrefix(host) {
+		// host:port segments whose hostname can never be routed back
+		// (localhost:3000, 127.0.0.1:PORT) are dev artifacts, not SPA routes;
+		// 404 them instead of falling back to the target.
+		if strings.Contains(host, ":") && isUnroutableHost(host) {
+			http.NotFound(w, r)
+			return
+		}
 		if p.cfg.RootFallback {
 			// SPA mode: client-side routed apps read location.pathname, so
 			// unprefixed paths (and their root-relative API calls) are proxied
@@ -474,6 +481,9 @@ func (p *Proxy) serveReverse(w http.ResponseWriter, r *http.Request, target *url
 
 func (p *Proxy) modifyResponse(resp *http.Response) {
 	h := resp.Header
+	if resp.Request != nil {
+		p.debugLogf("UPSTREAM-RESP %s %s -> %d Location=%q", resp.Request.Method, resp.Request.URL.String(), resp.StatusCode, h.Get("Location"))
+	}
 	for _, k := range []string{
 		"Content-Security-Policy",
 		"Content-Security-Policy-Report-Only",

@@ -185,6 +185,30 @@ func TestRewriteURL(t *testing.T) {
 	}
 }
 
+func TestLocalhostNeverProxied(t *testing.T) {
+	p := testProxy(t)
+	for _, host := range []string{"localhost", "localhost:3000", "127.0.0.1", "127.0.0.1:3000", "[::1]", "[::1]:3000", "intranet"} {
+		if p.shouldProxyHost(host) {
+			t.Errorf("shouldProxyHost(%q) = true, want false", host)
+		}
+	}
+	for _, host := range []string{"claude.ai", "api.claude.ai", "example.com:8443", "api.claude.ai:8443"} {
+		if !p.shouldProxyHost(host) {
+			t.Errorf("shouldProxyHost(%q) = false, want true", host)
+		}
+	}
+	cases := []struct{ in, want string }{
+		{"http://localhost:3000/api/auth/error", "http://localhost:3000/api/auth/error"},
+		{"//localhost:3000/api/auth/error", "//localhost:3000/api/auth/error"},
+		{"http://127.0.0.1:3000/x", "http://127.0.0.1:3000/x"},
+	}
+	for _, c := range cases {
+		if got := p.rewriteURL(c.in); got != c.want {
+			t.Errorf("rewriteURL(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func testProxyExtra(t *testing.T) *Proxy {
 	t.Helper()
 	p := testProxy(t)

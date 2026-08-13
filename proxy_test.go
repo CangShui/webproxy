@@ -458,6 +458,23 @@ func TestSentinelServedThroughProxy(t *testing.T) {
 // TestProxyCatchAllRouting verifies that the first path segment of an incoming
 // request routes upstream to that host when it looks like a hostname (catch-all),
 // while ordinary site paths (robots.txt) keep falling back to the target host.
+func TestProxyLocalhostHostPort404(t *testing.T) {
+	own, _ := newTestStack(t)
+	// A host:port first segment with an unroutable hostname must 404 locally
+	// instead of falling back to the target.
+	for _, p := range []string{"/localhost:3000/api/auth/error", "/intranet:8080/x"} {
+		status, _, _ := get(t, own.URL+p)
+		if status != http.StatusNotFound {
+			t.Errorf("GET %s status = %d, want 404", p, status)
+		}
+	}
+	// Ordinary SPA paths still fall back to the target.
+	status, h, _ := get(t, own.URL+"/app.js")
+	if status != http.StatusOK || h.Get("X-Upstream-Host") == "" {
+		t.Errorf("SPA fallback broken: status=%d host=%q", status, h.Get("X-Upstream-Host"))
+	}
+}
+
 func TestProxyCatchAllRouting(t *testing.T) {
 	own, prefix := newTestStack(t)
 

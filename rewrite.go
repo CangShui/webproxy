@@ -101,6 +101,49 @@ func hostnameOnly(host string) string {
 	return host
 }
 
+// isUnroutableHost reports whether host can never be routed back through the
+// proxy: loopback/special-use names (localhost, 127.0.0.0/8, ::1) and
+// single-label names such as "intranet". Rewriting these into /host/... URLs
+// would only produce 404s or dead-end connections, so they are left to load
+// straight from their real origin.
+func isUnroutableHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if h == "" {
+		return true
+	}
+	// Bracketed IPv6 literal: [::1]:8080 -> ::1
+	if strings.HasPrefix(h, "[") {
+		if i := strings.IndexByte(h, ']'); i >= 0 {
+			h = h[1:i]
+		}
+	} else if i := strings.LastIndexByte(h, ':'); i >= 0 {
+		// host:port -- only strip when the port is numeric, otherwise the
+		// string is not a host at all.
+		port := h[i+1:]
+		if port != "" {
+			numeric := true
+			for _, c := range port {
+				if c < '0' || c > '9' {
+					numeric = false
+					break
+				}
+			}
+			if !numeric {
+				return false
+			}
+		}
+		h = h[:i]
+	}
+	if h == "" || h == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return ip.IsLoopback()
+	}
+	// Single-label names (intranet, router, ...) cannot be routed back.
+	return !strings.Contains(h, ".")
+}
+
 // commonFileExtRe matches last labels that are far more likely to be file
 // extensions than TLDs (robots.txt, index.html, app.js, ...), so legitimate
 // site paths are not mistaken for host prefixes.
@@ -183,6 +226,13 @@ func (p *Proxy) shouldProxyHost(host string) bool {
 		if hostname == d || strings.HasSuffix(hostname, "."+d) {
 			return false
 		}
+	}
+	// Catch-all: every other external host is proxied. Hosts that can never
+	// be routed back (localhost, loopback addresses, single-label names) are
+	// left alone unless they are known proxy hosts (e.g. a loopback test
+	// target or a sibling subdomain).
+	if !p.isProxyHost(host) && isUnroutableHost(host) {
+		return false
 	}
 	return true
 }
