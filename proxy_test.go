@@ -647,3 +647,67 @@ func TestProxyCatchAllRouting(t *testing.T) {
 		t.Fatalf("root fallback upstream Host = %q, want %q (status %d)", got, prefix, status)
 	}
 }
+func TestRewriteRequestHeadersStripsProxyChain(t *testing.T) {
+	own, _ := url.Parse("http://localhost:8080")
+	tgt, _ := url.Parse("https://chatgpt.com")
+	p := NewProxy(Config{OwnDomain: own, Target: tgt, Listen: ":8080"})
+
+	req := httptest.NewRequest("GET", "http://localhost:8080/x", nil)
+	req.Header.Set("Via", "2.0 Caddy")
+	req.Header.Set("X-Forwarded-For", "1.2.3.4")
+	req.Header.Set("X-Forwarded-Host", "proxy.example")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("Forwarded", "for=1.2.3.4")
+	req.Header.Set("Authorization", "Basic dGVzdDp0ZXN0")
+	// a Bearer token must survive
+	req.Header.Set("X-Test-Bearer", "present")
+
+	p.rewriteRequestHeaders(req)
+
+	for _, k := range []string{"Via", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "Forwarded"} {
+		if got := req.Header.Get(k); got != "" {
+			t.Errorf("proxy-chain header %q not stripped (got %q)", k, got)
+		}
+	}
+	if got := req.Header.Get("Authorization"); got != "" {
+		t.Errorf("Basic Authorization not stripped (got %q)", got)
+	}
+}
+
+func TestRewriteRequestHeadersKeepsBearerAuth(t *testing.T) {
+	own, _ := url.Parse("http://localhost:8080")
+	tgt, _ := url.Parse("https://chatgpt.com")
+	p := NewProxy(Config{OwnDomain: own, Target: tgt, Listen: ":8080"})
+
+	req := httptest.NewRequest("GET", "http://localhost:8080/x", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	p.rewriteRequestHeaders(req)
+	if got := req.Header.Get("Authorization"); got != "Bearer secret-token" {
+		t.Errorf("Bearer Authorization should survive, got %q", got)
+	}
+}
+func TestCookieScopedPerHostPrefix(t *testing.T) {
+	own, _ := url.Parse("http://localhost:8080")
+	tgt, _ := url.Parse("https://chatgpt.com")
+	p := NewProxy(Config{OwnDomain: own, Target: tgt, RootFallback: true})
+
+	// Prefixed host (auth.openai.com) cookie must keep its /auth.openai.com/ path,
+	// so it does not leak onto sibling hosts like auth-cdn.oaistatic.com.
+	req := httptest.NewRequest("GET", "http://localhost:8080/auth.openai.com/x", nil)
+	ctx := context.WithValue(req.Context(), ctxKeyPrefix, "/auth.openai.com/")
+	req = req.WithContext(ctx)
+	resp := &http.Response{
+		Header:  http.Header{},
+		Request: req,
+	}
+	resp.Header.Set("Content-Type", "text/html")
+	resp.Header.Set("Set-Cookie", "__cf_bm=abc; Path=/; Secure; HttpOnly")
+	resp.Body = io.NopCloser(strings.NewReader("<html></html>"))
+	p.modifyResponse(resp)
+	if got := resp.Header.Get("Set-Cookie"); !strings.Contains(got, "Path=/auth.openai.com/") {
+		t.Errorf("prefixed-host cookie not scoped to its prefix: %q", got)
+	}
+	if strings.Contains(resp.Header.Get("Set-Cookie"), "Path=/;") {
+		t.Errorf("prefixed-host cookie must not stay at root path: %q", resp.Header.Get("Set-Cookie"))
+	}
+}

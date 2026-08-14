@@ -255,6 +255,22 @@ func (p *Proxy) redirect(w http.ResponseWriter, r *http.Request, to string) {
 // out. The app normally runs on the real target origin, so pages served
 // through the proxy must look like they came from that origin.
 func (p *Proxy) rewriteRequestHeaders(req *http.Request) {
+	// Strip proxy-chain headers added by a front reverse proxy (Caddy, nginx,
+	// ...). Forwarding them to the target both leaks the proxy chain and,
+	// combined with the front proxy's Basic-auth credentials, forms a
+	// "proxied + authed + spoofed client hints" signature that Cloudflare's
+	// WAF rejects with 403 (cf-cache-status: BYPASS). The target only cares
+	// about the request, not the hop chain in front of this proxy.
+	for _, k := range []string{"Via", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-Ip", "Forwarded"} {
+		req.Header.Del(k)
+	}
+	// A front proxy's HTTP Basic-auth credentials (e.g. Caddy's basic_auth) are
+	// meaningless to the upstream and, together with the proxy-chain headers,
+	// trip Cloudflare's WAF. Strip only the "Basic" scheme; Bearer tokens and
+	// other schemes the site itself uses must still pass through.
+	if strings.HasPrefix(strings.TrimSpace(req.Header.Get("Authorization")), "Basic ") {
+		req.Header.Del("Authorization")
+	}
 	if o := req.Header.Get("Origin"); o != "" {
 		if ou, err := url.Parse(o); err == nil && ou.Scheme != "" && strings.EqualFold(ou.Hostname(), p.ownHost) {
 			req.Header.Set("Origin", p.realOrigin(req))
@@ -717,9 +733,14 @@ func (p *Proxy) modifyResponse(resp *http.Response) {
 
 	if sc := h.Values("Set-Cookie"); len(sc) > 0 {
 		prefix, _ := ctxString(resp, ctxKeyPrefix)
-		if p.cfg.RootFallback {
-			// In SPA mode the app runs at root semantics, so cookies must be
-			// visible to both prefixed and unprefixed paths.
+		// Cookies must be scoped per upstream host. Only the target host's
+		// cookies may live at the root path (SPA / root-site semantics);
+		// every other proxied host (auth.openai.com, auth-cdn.oaistatic.com,
+		// ...) keeps its own /host/ prefix. Flattening every cookie to "/"
+		// leaks one host's domain-scoped cookies (Cloudflare's __cf_bm,
+		// __cflb, _cfuvid) onto sibling hosts, which Cloudflare's WAF rejects
+		// with 403 (cf-cache-status: BYPASS).
+		if p.cfg.RootFallback && (prefix == "/" || prefix == "/"+p.targetHost+"/") {
 			prefix = "/"
 		}
 		h.Del("Set-Cookie")
