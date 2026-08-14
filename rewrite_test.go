@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -899,5 +901,48 @@ func TestShimTemplateBalanced(t *testing.T) {
 	}
 	if depth != 0 {
 		t.Fatalf("shim brace depth = %d, want 0", depth)
+	}
+}
+
+func TestModifyResponseDecompressesGzipForRewrite(t *testing.T) {
+	p := testProxy(t)
+	html := []byte(`<!DOCTYPE html><html><head><title>x</title></head><body><a href="/login">l</a></body></html>`)
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	gz.Write(html)
+	gz.Close()
+
+	resp := &http.Response{Header: http.Header{}}
+	resp.Header.Set("Content-Type", "text/html; charset=utf-8")
+	resp.Header.Set("Content-Encoding", "gzip")
+	resp.StatusCode = http.StatusOK
+	resp.Body = io.NopCloser(bytes.NewReader(buf.Bytes()))
+	p.modifyResponse(resp)
+
+	if got := resp.Header.Get("Content-Encoding"); got != "" {
+		t.Errorf("Content-Encoding = %q, want removed (identity)", got)
+	}
+	read, _ := io.ReadAll(resp.Body)
+	out := string(read)
+	if !strings.Contains(out, `<a href="http://localhost:8080/claude.ai/login">`) {
+		t.Errorf("gzip HTML not rewritten (href missing):\n%s", out)
+	}
+}
+
+func TestModifyResponseUnknownEncodingPassesThrough(t *testing.T) {
+	p := testProxy(t)
+	compressed := []byte("notBrotli")
+	resp := &http.Response{Header: http.Header{}}
+	resp.Header.Set("Content-Type", "text/html")
+	resp.Header.Set("Content-Encoding", "x-unknown")
+	resp.StatusCode = http.StatusOK
+	resp.Body = io.NopCloser(bytes.NewReader(compressed))
+	p.modifyResponse(resp)
+	if got := resp.Header.Get("Content-Encoding"); got != "x-unknown" {
+		t.Errorf("Content-Encoding = %q, want preserved on unknown encoding", got)
+	}
+	read, _ := io.ReadAll(resp.Body)
+	if string(read) != string(compressed) {
+		t.Errorf("unknown-encoding body altered")
 	}
 }

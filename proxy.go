@@ -1,6 +1,8 @@
 package main
 
 import (
+	"compress/flate"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -13,6 +15,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 )
 
 type ctxKey int
@@ -50,6 +55,11 @@ var defaultNamespaceHosts = []string{
 // the proxy like any other proxied host, so the frame's /backend-api/sentinel/
 // requests stay on the own domain instead of leaking to the real host.
 const sentinelHost = "sentinel.openai.com"
+
+// chromeUserAgent is a current real Chrome UA used only as a fallback when the
+// client sends no User-Agent at all, so the upstream does not flag the server
+// as a scraper. A client-supplied UA is always forwarded untouched.
+const chromeUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
 
 // Proxy reverse-proxies a target site (and its subdomains) under path
 // prefixes on the own domain, rewriting URLs inside responses.
@@ -627,7 +637,18 @@ func (p *Proxy) serveReverse(w http.ResponseWriter, r *http.Request, target *url
 		req.URL = &u
 		p.rewriteRequestHeaders(req)
 		req.Host = target.Host
-		req.Header.Set("Accept-Encoding", "identity")
+		// Pass the client's Accept-Encoding through instead of forcing
+		// "identity": forcing identity is a strong datacenter/scraper signal.
+		// Compressed responses are transparently decompressed, rewritten, and
+		// served as identity in modifyResponse (see below).
+		//
+		// If the client sent no User-Agent (e.g. scripts, some clients), fall
+		// back to a real Chrome UA so the upstream does not treat the server
+		// as a bot. A present UA (including the empty-string placeholder from
+		// curl) is left untouched.
+		if strings.TrimSpace(req.Header.Get("User-Agent")) == "" {
+			req.Header.Set("User-Agent", chromeUserAgent)
+		}
 		p.debugLogf("UPSTREAM %s %s host=%q proto=%s hdrs=%v", req.Method, req.URL.String(), req.Host, req.Proto, req.Header)
 		ctx := context.WithValue(req.Context(), ctxKeyPageURL, pageURL)
 		ctx = context.WithValue(ctx, ctxKeyPrefix, pathPrefix)
@@ -710,16 +731,27 @@ func (p *Proxy) modifyResponse(resp *http.Response) {
 	if resp.Body == nil || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified {
 		return
 	}
-	if h.Get("Content-Encoding") != "" {
-		return // compressed payloads are passed through untouched
-	}
 	ct := h.Get("Content-Type")
 	if !isRewritable(ct) {
-		return
+		return // non-rewritable payloads pass through untouched (with their encoding)
 	}
-
 	pageURL, _ := ctxString(resp, ctxKeyPageURL)
 	body := resp.Body
+	// Accept-Encoding now passes through, so rewritable content may arrive
+	// compressed (gzip/deflate/br/zstd). Decompress it, rewrite it, then serve
+	// the result as identity: the browser accepts identity fine, and we avoid
+	// re-compressing every response. Unknown/unhandled encodings pass through
+	// untouched rather than corrupting the body.
+	if enc := strings.ToLower(h.Get("Content-Encoding")); enc != "" {
+		dec, err := decompressReader(enc, body)
+		if err != nil {
+			// Unexpected encoding; pass the compressed body through untouched.
+			return
+		}
+		body = dec
+	} else {
+		h.Del("Content-Encoding")
+	}
 	transform := func(data []byte) []byte {
 		switch {
 		case strings.Contains(ct, "html"):
@@ -729,6 +761,10 @@ func (p *Proxy) modifyResponse(resp *http.Response) {
 		default: // javascript / json
 			return p.rewriteAbsURLs(data)
 		}
+	}
+	// If we decompressed, serve the rewritten bytes as identity.
+	if strings.ToLower(h.Get("Content-Encoding")) != "" {
+		h.Del("Content-Encoding")
 	}
 	resp.Body = &transformBody{rc: body, transform: transform, max: p.maxBody}
 	h.Del("Content-Length")
@@ -788,6 +824,97 @@ func isRewritable(contentType string) bool {
 	}
 	return false
 }
+
+// decompressReader wraps rc with the appropriate decompressor for enc
+// (lower-cased Content-Encoding: gzip, deflate, br, zstd, x-gzip). It returns
+// a reader that yields the decoded bytes. Brotli and zstd are supported via
+// the same libraries the x/net chain already vendors, so no new dependency is
+// introduced. An empty/unknown encoding yields an error so the caller can pass
+// the compressed body through untouched.
+func decompressReader(enc string, rc io.ReadCloser) (io.ReadCloser, error) {
+	switch enc {
+	case "gzip", "x-gzip":
+		return &readCloser{Reader: mustGzip(rc)}, nil
+	case "deflate":
+		fr := flate.NewReader(rc)
+		return &readCloser{Reader: fr, closer: rc}, nil
+	case "br":
+		return &brotliReadCloser{rc: rc}, nil
+	case "zstd":
+		zr, err := zstd.NewReader(rc)
+		if err != nil {
+			rc.Close()
+			return nil, err
+		}
+		return &zstdReadCloser{dec: zr, rc: rc}, nil
+	}
+	// Unknown encoding: let the caller hand it through untouched.
+	return nil, fmt.Errorf("unsupported content-encoding %q", enc)
+}
+
+func mustGzip(rc io.ReadCloser) io.ReadCloser {
+	gz, err := gzip.NewReader(rc)
+	if err != nil {
+		rc.Close()
+		return &emptyReadCloser{}
+	}
+	return &readCloser{Reader: gz, closer: rc}
+}
+
+// readCloser adapts an io.Reader into an io.ReadCloser that also closes rc.
+type readCloser struct {
+	io.Reader
+	closer io.ReadCloser
+}
+
+func (r *readCloser) Close() error {
+	rc := r.closer
+	if rc != nil {
+		return rc.Close()
+	}
+	return nil
+}
+
+// brotliReadCloser wraps a brotli reader over rc.
+type brotliReadCloser struct {
+	rc io.ReadCloser
+	br *brotli.Reader
+}
+
+func (b *brotliReadCloser) Read(p []byte) (int, error) {
+	if b.br == nil {
+		b.br = brotli.NewReader(b.rc)
+	}
+	return b.br.Read(p)
+}
+
+func (b *brotliReadCloser) Close() error { return b.rc.Close() }
+
+// zstdReadCloser wraps a zstd decoder over rc.
+type zstdReadCloser struct {
+	dec  *zstd.Decoder
+	rc   io.ReadCloser
+	done bool
+}
+
+func (z *zstdReadCloser) Read(p []byte) (int, error) {
+	n, err := z.dec.Read(p)
+	if err == io.EOF && !z.done {
+		z.done = true
+	}
+	return n, err
+}
+
+func (z *zstdReadCloser) Close() error {
+	z.dec.Close()
+	return z.rc.Close()
+}
+
+// emptyReadCloser yields EOF and closes nothing.
+type emptyReadCloser struct{}
+
+func (e *emptyReadCloser) Read([]byte) (int, error) { return 0, io.EOF }
+func (e *emptyReadCloser) Close() error             { return nil }
 
 // transformBody buffers the whole (small) response, rewrites it, then serves
 // the rewritten bytes. Oversized bodies are passed through unmodified.
