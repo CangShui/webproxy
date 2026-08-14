@@ -105,6 +105,32 @@ webproxy -tls -own-domain https://example.com -target https://chatgpt.com -liste
 - Sentinel 反爬 frame 及其 `/backend-api/sentinel/req` 请求也会经反代处理，
   不会泄漏到真实的 `sentinel.openai.com`
 
+## 重要：路径前缀 vs 根站点模式
+
+默认（不传 `-root-site`）时，目标站挂在你的域名**路径前缀**下
+（`https://own/chatgpt.com/...`）。这对绝大多数普通网站没问题，但对
+**现代 SPA**（ChatGPT、Claude 这类 Vite + React Router 应用）是脆弱的：
+它们假设自己跑在域名根。路径前缀会让同一份 JS 模块（如 React）在
+`/chatgpt.com/cdn/...` 和 `/cdn/...` 两个地址各加载一份，导致 React 上下文断裂
+（控制台 `Cannot read properties of null (reading 'useContext')`），表现为侧边栏
+点击 **图片 / 资料库 / 插件 / 项目** 出现 **Content failed to load**。
+
+**推荐：给每个站用一个独立子域，开启 `-root-site`**——目标站直接挂在子域根、
+无任何路径前缀，和 nginx `proxy_pass` 行为一致，SPA 完全按原生方式运行：
+
+```bash
+webproxy -tls -own-domain https://chatgpt.example.com -target https://chatgpt.com -listen :443 -root-site
+```
+
+访问 `https://chatgpt.example.com/`（直接是 ChatGPT 首页）。登录跳 `auth.openai.com`
+仍会自动反代为 `https://chatgpt.example.com/auth.openai.com/...`（其它域保持前缀形式）。
+建议 Caddy/Nginx 前端做 SSL 终止并反代到容器的 8080，如上面的 Compose 示例。
+
+### 两种模式对比
+
+- **默认（路径前缀）**：多个站共用一个域名/端口，按 `/host/` 区分；普通站可用，SPA 会有上述模块重复问题。
+- **`-root-site`（根站点）**：一个子域反代一个目标站，挂在根路径；现代 SPA 推荐，问题最少。
+
 ## Docker 使用
 
 每次 GitHub Release 会自动构建容器镜像并推送到仓库自带的容器仓库

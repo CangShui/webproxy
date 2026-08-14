@@ -146,6 +146,11 @@ func isUnroutableHost(host string) bool {
 // commonFileExtRe matches last labels that are far more likely to be file
 // extensions than TLDs (robots.txt, index.html, app.js, ...), so legitimate
 // site paths are not mistaken for host prefixes.
+// routeMarkerRe further excludes React Router v7 Vite data-route markers
+// (*.data / *._data / *.loader); no real public TLD is "data" or "loader", so
+// a first path segment ending in one is an SPA data route, not a host.
+var routeMarkerRe = regexp.MustCompile(`(?i)^(data|_data|loader|__loader)$`)
+
 var commonFileExtRe = regexp.MustCompile(`(?i)^(a?png|aspx?|avif|bmp|cgi|cfm|css|csv|do|docx?|eot|gif|gz|htm[l]?|ico|jpe?g|jsp|js|json|map|md|mjs|cjs|mov|mp3|mp4|otf|pdf|php|pl|png|ppt[x]?|py|rar|rss|shtml|svg|tar|tex|ts|ttf|txt|wav|wasm|webmanifest|webm|webp|woff2?|xlsx?|xml|zip)$`)
 
 // looksLikeHost reports whether s plausibly names a real host (a registered
@@ -200,7 +205,7 @@ func looksLikeHost(s string) bool {
 			return false
 		}
 	}
-	return !commonFileExtRe.MatchString(last)
+	return !commonFileExtRe.MatchString(last) && !routeMarkerRe.MatchString(last)
 }
 
 // shouldProxyHost reports whether absolute URLs pointing at host should be
@@ -268,6 +273,19 @@ func (p *Proxy) rewriteURL(raw string) string {
 	return p.rewriteURLIn(raw, "")
 }
 
+// ownURLFor returns the own-domain URL corresponding to an upstream absolute
+// URL's host + path. In root-site mode the target host is served at the
+// own-domain root: https://chatgpt.com/x becomes OWN/x with no host segment,
+// which is what keeps Vite/React Router module URLs unprefixed and unique.
+// Every other proxied host (and the target's subdomains) keeps the /host/
+// prefixed form, preserving how the proxy routes cross-domain resources.
+func (p *Proxy) ownURLFor(host, path string) string {
+	if p.cfg.RootSite && strings.EqualFold(hostnameOnly(host), p.targetHostname) {
+		return p.ownOrigin + path
+	}
+	return p.ownOrigin + "/" + host + path
+}
+
 // pageHostOf returns the proxied host prefix embedded in a page URL served by
 // the proxy (e.g. "auth.openai.com" for https://example.com/auth.openai.com/x),
 // or "" when the page has no host prefix (root fallback) or the first path
@@ -279,6 +297,12 @@ func (p *Proxy) pageHostOf(pageURL string) string {
 	}
 	host, _ := splitPathPrefix(u.Path)
 	if host == "" || !p.isProxiedHostPrefix(host) {
+		return ""
+	}
+	// In root-site mode the target host is served at the own-domain root, so a
+	// /targethost/... path is no longer a host prefix - treat it as a root page
+	// (pageHost "") so its URLs are rewritten to the unprefixed root form.
+	if p.cfg.RootSite && strings.EqualFold(hostnameOnly(host), p.targetHostname) {
 		return ""
 	}
 	return host
@@ -303,12 +327,16 @@ func (p *Proxy) rewriteURLIn(raw, pageHost string) string {
 		switch u.Scheme {
 		case "http", "https":
 			if p.shouldProxyHost(u.Host) {
-				return p.rewriteURLParams(p.ownOrigin + "/" + u.Host + uriOf(u))
+				return p.rewriteURLParams(p.ownURLFor(u.Host, uriOf(u)))
 			}
 		case "ws", "wss":
-			// WebSocket URLs keep their scheme and move the host into the own
-			// domain's host prefix: wss://ws.chatgpt.com/x -> wss://own/x.
+			// WebSocket URLs keep their scheme and move the host to the own
+			// domain: ws.chatgpt.com/x -> wss://own/x (root-site target) or
+			// wss://own/sub.host/x.
 			if p.shouldProxyHost(u.Host) {
+				if p.cfg.RootSite && strings.EqualFold(hostnameOnly(u.Host), p.targetHostname) {
+					return u.Scheme + "://" + p.cfg.OwnDomain.Host + uriOf(u)
+				}
 				return u.Scheme + "://" + p.cfg.OwnDomain.Host + "/" + u.Host + uriOf(u)
 			}
 		}
@@ -316,7 +344,7 @@ func (p *Proxy) rewriteURLIn(raw, pageHost string) string {
 	}
 	if strings.HasPrefix(raw, "//") {
 		if p.shouldProxyHost(u.Host) {
-			return p.rewriteURLParams(p.ownOrigin + "/" + u.Host + uriOf(u))
+			return p.rewriteURLParams(p.ownURLFor(u.Host, uriOf(u)))
 		}
 		return raw
 	}
@@ -325,18 +353,18 @@ func (p *Proxy) rewriteURLIn(raw, pageHost string) string {
 			return raw
 		}
 		host := pageHost
+		// In root-site mode a page served at the own-domain root resolves its
+		// root-relative URLs directly to the target root (no prefix added),
+		// matching what the proxy routes. Prefix-less root URLs are exactly
+		// what Vite/React Router expect, so module identity is preserved.
+		if pageHost != "" {
+			return p.rewriteURLParams("/" + pageHost + uriOf(u))
+		}
+		if p.cfg.RootSite {
+			return raw
+		}
 		if host == "" {
 			host = p.targetHost
-		}
-		if pageHost != "" {
-			// Pages served under a host prefix: emit the prefix as a
-			// root-relative path (/chatgpt.com/images) instead of an
-			// absolute URL. Both resolve to the same URL against the own
-			// origin, but the root-relative form matches what an SPA router
-			// with basename /chatgpt.com renders after hydration, so the
-			// router intercepts link clicks and navigates client-side
-			// instead of triggering a full page reload.
-			return p.rewriteURLParams("/" + host + uriOf(u))
 		}
 		return p.rewriteURLParams(p.ownOrigin + "/" + host + uriOf(u))
 	}
@@ -720,10 +748,13 @@ func (p *Proxy) rewriteAbsURLs(data []byte) []byte {
 			return m
 		}
 		if scheme == "wss" || scheme == "ws" {
-			// WebSocket URLs keep their scheme and move the host into the
-			// own domain's host prefix: wss://ws.chatgpt.com/x -> wss://own/x.
+			// WebSocket URLs keep their scheme and move the host to the own
+			// domain: wss://ws.chatgpt.com/x -> wss://own/x.
+			if p.cfg.RootSite && strings.EqualFold(hostnameOnly(host), p.targetHostname) {
+				return []byte(scheme + "://" + p.cfg.OwnDomain.Host + path)
+			}
 			return []byte(scheme + "://" + p.cfg.OwnDomain.Host + "/" + host + path)
 		}
-		return []byte(p.rewriteURLParams(p.ownOrigin + "/" + host + path))
+		return []byte(p.rewriteURLParams(p.ownURLFor(host, path)))
 	})
 }

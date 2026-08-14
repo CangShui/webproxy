@@ -22,6 +22,7 @@ type Config struct {
 	ExtraDomains  []string // extra registrable domains to proxy, with subdomains (e.g. openai.com)
 	DirectDomains []string // hostnames never proxied; loaded from their real origin (e.g. sentinel.openai.com)
 	RootFallback  bool     // proxy unprefixed paths to the target (SPA mode)
+	RootSite      bool     // serve the target at the own-domain root ("/"), no path prefix (nginx-style SPA hosting)
 	UpstreamProxy *url.URL // optional socks5:// or http:// proxy for upstream fetches
 	TLS           bool     // serve HTTPS
 	CertFile      string   // TLS certificate file (PEM)
@@ -34,6 +35,7 @@ func main() {
 	listen := flag.String("listen", ":8080", "listen address, e.g. :8080")
 	barePrefix := flag.String("bare-prefix", "/cdn-cgi/", "comma-separated extra root paths proxied straight to the target, e.g. /cdn-cgi/")
 	rootFallback := flag.Bool("root-fallback", true, "proxy unprefixed paths to the target (SPA mode; makes client-side routed apps work)")
+	rootSite := flag.Bool("root-site", false, "serve the target at the own-domain root \"/\" with no path prefix (nginx-style; use with a dedicated subdomain per target). Client-side-router SPAs like ChatGPT/Claude work best this way.")
 	extraDomain := flag.String("extra-domain", "", "optional: extra registrable domains to treat as known hosts (all external hosts are proxied by default anyway), e.g. openai.com")
 	directDomain := flag.String("direct-domain", "", "comma-separated hostnames that must never be proxied (loaded straight from their real origin), e.g. hcaptcha.com if the CAPTCHA breaks")
 	tlsFlag := flag.Bool("tls", false, "serve HTTPS with a self-signed certificate (auto-generated and reused)")
@@ -42,7 +44,7 @@ func main() {
 	keyFile := flag.String("key", "", "TLS private key file (PEM); requires -cert")
 	flag.Parse()
 
-	cfg, err := parseConfig(*ownDomain, *target, *listen, *barePrefix, *rootFallback, *extraDomain, *directDomain, *tlsFlag, *certFile, *keyFile, *upstreamProxy)
+	cfg, err := parseConfig(*ownDomain, *target, *listen, *barePrefix, *rootFallback, *rootSite, *extraDomain, *directDomain, *tlsFlag, *certFile, *keyFile, *upstreamProxy)
 	if err != nil {
 		log.Fatalf("invalid configuration: %v", err)
 	}
@@ -65,8 +67,12 @@ func main() {
 	fmt.Printf("  Listen:   %s (%s)\n", cfg.Listen, scheme)
 	fmt.Printf("  Own site: %s\n", cfg.OwnDomain.String())
 	fmt.Printf("  Target:   %s\n", cfg.Target.String())
-	fmt.Printf("  Access:   %s/%s/\n", base, cfg.Target.Host)
-	fmt.Printf("  SPA mode: root-fallback=%v\n", cfg.RootFallback)
+	if cfg.RootSite {
+		fmt.Printf("  Access:   %s/  (target served at own-domain root, no /%s/ prefix)\n", base, cfg.Target.Host)
+	} else {
+		fmt.Printf("  Access:   %s/%s/\n", base, cfg.Target.Host)
+	}
+	fmt.Printf("  SPA mode: root-fallback=%v root-site=%v\n", cfg.RootFallback, cfg.RootSite)
 	fmt.Println("  Rewrite: all external links are proxied by default; use -direct-domain to exclude hosts")
 	if len(cfg.ExtraDomains) > 0 {
 		fmt.Printf("  Extra:    proxied domains: %s\n", strings.Join(cfg.ExtraDomains, ", "))
@@ -103,7 +109,7 @@ func main() {
 	}
 }
 
-func parseConfig(ownDomain, target, listen, barePrefix string, rootFallback bool, extraDomain, directDomain string, tlsFlag bool, certFile, keyFile string, upstreamProxy string) (Config, error) {
+func parseConfig(ownDomain, target, listen, barePrefix string, rootFallback, rootSite bool, extraDomain, directDomain string, tlsFlag bool, certFile, keyFile string, upstreamProxy string) (Config, error) {
 	var cfg Config
 	own, err := url.Parse(ownDomain)
 	if err != nil {
@@ -135,6 +141,8 @@ func parseConfig(ownDomain, target, listen, barePrefix string, rootFallback bool
 	cfg.Target = tgt
 	cfg.Listen = listen
 	cfg.RootFallback = rootFallback
+	cfg.RootFallback = cfg.RootFallback || rootSite // root-site implies unprefixed paths go to the target
+	cfg.RootSite = rootSite
 	for _, d := range strings.Split(extraDomain, ",") {
 		d = strings.ToLower(strings.TrimSpace(d))
 		if d == "" {

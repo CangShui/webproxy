@@ -92,6 +92,11 @@ func NewProxy(cfg Config) *Proxy {
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	if path == "" || path == "/" {
+		if p.cfg.RootSite {
+			target := &url.URL{Scheme: p.targetScheme, Host: p.targetHost, Path: "/"}
+			p.serveReverse(w, r, target, p.pageURL(r), "/")
+			return
+		}
 		p.redirect(w, r, "/"+p.targetHost+"/")
 		return
 	}
@@ -139,8 +144,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// ("origin + /backend-api/sentinel/"), which becomes a host-prefix-less
 	// path on the own domain. Route those straight to sentinel.openai.com and
 	// synthesize the frame document (Cloudflare blocks Go's own fetch of the
-	// real frame.html with 404/403).
-	if strings.HasPrefix(path, "/backend-api/sentinel/") {
+	// real frame.html with 404/403). This only applies in the default path-
+	// prefixed mode: in root-site mode the target owns '/backend-api/sentinel/*'
+	// (e.g. chatgpt.com's own chat-requirements/prepare), so those paths must
+	// reach the target, not sentinel.openai.com.
+	if !p.cfg.RootSite && strings.HasPrefix(path, "/backend-api/sentinel/") {
 		if strings.HasPrefix(path, "/backend-api/sentinel/frame.html") {
 			p.serveSentinelFrame(w, r)
 			return
@@ -185,12 +193,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if p.cfg.RootFallback {
 			// SPA mode: client-side routed apps read location.pathname, so
 			// unprefixed paths (and their root-relative API calls) are proxied
-			// straight to the target host.
+			// straight to the target host. In root-site mode the target lives
+			// at the own-domain root, so the fallback prefix is "/".
+			prefix := "/" + p.targetHost + "/"
+			if p.cfg.RootSite {
+				prefix = "/"
+			}
 			target := &url.URL{Scheme: p.targetScheme, Host: p.targetHost, Path: path}
 			if r.URL.RawQuery != "" {
 				target.RawQuery = r.URL.RawQuery
 			}
-			p.serveReverse(w, r, target, p.pageURL(r), "/"+p.targetHost+"/")
+			p.serveReverse(w, r, target, p.pageURL(r), prefix)
 			return
 		}
 		http.NotFound(w, r)
@@ -328,6 +341,18 @@ func (p *Proxy) unrewriteURL(raw string) string {
 		}
 		return nu.String()
 	}
+	// Root-site mode: a root path with no proxied-host prefix belongs to the
+	// target host (served at the own-domain root), so restore it to upstream.
+	if p.cfg.RootSite {
+		nu := &url.URL{Scheme: p.targetScheme, Host: p.targetHost, Path: u.Path}
+		if u.RawQuery != "" {
+			nu.RawQuery = u.RawQuery
+		}
+		if u.Fragment != "" {
+			nu.Fragment = u.Fragment
+		}
+		return nu.String()
+	}
 	nu := &url.URL{Scheme: p.targetScheme, Host: p.targetHost, Path: u.Path}
 	if u.RawQuery != "" {
 		nu.RawQuery = u.RawQuery
@@ -359,13 +384,13 @@ func (p *Proxy) rewriteLocation(raw, pageURL string) string {
 			return raw
 		}
 		if p.shouldProxyHost(u.Host) {
-			return p.rewriteURLParams(p.ownOrigin + "/" + u.Host + uriOf(u))
+			return p.rewriteURLParams(p.ownURLFor(u.Host, uriOf(u)))
 		}
 		return raw
 	}
 	if strings.HasPrefix(raw, "//") {
 		if p.shouldProxyHost(u.Host) {
-			return p.rewriteURLParams(p.ownOrigin + "/" + u.Host + uriOf(u))
+			return p.rewriteURLParams(p.ownURLFor(u.Host, uriOf(u)))
 		}
 		return raw
 	}
@@ -440,6 +465,22 @@ func (p *Proxy) unrewriteAbsParam(v string) string {
 	}
 	host, rest := splitPathPrefix(u.Path)
 	if !p.isProxiedHostPrefix(host) {
+		// Root-site mode: a root URL with no host prefix maps to the target
+		// host (served at the own-domain root).
+		if p.cfg.RootSite {
+			path := u.Path
+			if path == "" {
+				path = "/"
+			}
+			nu := &url.URL{Scheme: p.targetScheme, Host: p.targetHost, Path: path}
+			if u.RawQuery != "" {
+				nu.RawQuery = u.RawQuery
+			}
+			if u.Fragment != "" {
+				nu.Fragment = u.Fragment
+			}
+			return nu.String()
+		}
 		return v
 	}
 	if rest == "" {
