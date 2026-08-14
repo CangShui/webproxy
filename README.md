@@ -149,7 +149,10 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:17780:8080"
+    # 根站点模式：ChatGPT 直接挂在 https://chatgpt.example.com 根路径，
+    # 无 /chatgpt.com/ 前缀，SPA（侧边栏图片/资料库/插件/项目等）最稳。
     command:
+      - -root-site
       - -own-domain
       - https://chatgpt.example.com
       - -target
@@ -171,7 +174,8 @@ chatgpt.example.com {
 }
 ```
 
-然后 `docker compose up -d` 启动，浏览器访问 `https://chatgpt.example.com/chatgpt.com/`。
+然后 `docker compose up -d` 启动，浏览器访问 `https://chatgpt.example.com/`（因为开了
+`-root-site`，ChatGPT 直接挂在域名根，不再是 `/chatgpt.com/`）。
 说明：
 
 - `-own-domain` 必须用 `https://` 公网地址，这样重写出来的 URL 才是 https，

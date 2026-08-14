@@ -1,6 +1,11 @@
+# 推荐部署方式：一个子域反代一个目标站，开启 -root-site。
+#
+#  - 目标站直接挂在自己的 https://chatgpt.example.com 根路径上（无 /chatgpt.com/ 前缀），
+#    对 ChatGPT/Claude 这类现代 SPA 最稳，行为与 nginx proxy_pass 一致。
+#  - 前缀模式（不开 -root-site）会让 SPA 出现"同一 JS 模块双份加载 / 侧边栏点击
+#    Content failed to load"的问题，详见仓库 README。
+#  - 本示例只在宿主机回环 127.0.0.1:17780 暴露，SSL 由 Caddy 终止，不占用 80/443。
 services:
-  # webproxy 反代服务：Caddy 已部署在宿主机上做 SSL 终止，
-  # 只把 127.0.0.1:17780 转发给本容器，不占用宿主机的 80/443。
   webproxy:
     image: ghcr.io/cangshui/webproxy:latest
     container_name: webproxy
@@ -8,6 +13,7 @@ services:
     ports:
       - "127.0.0.1:17780:8080"
     command:
+      - -root-site
       - -own-domain
       - https://chatgpt.example.com
       - -target
@@ -15,7 +21,7 @@ services:
       - -listen
       - :8080
     # -tls 模式会把自签证书写到 /app/webproxy-cert.pem 和 /app/webproxy-key.pem，
-    # 挂载命名卷让证书在容器重建后仍然复用（不使用 -tls 时也可去掉）。
+    # 挂载命名卷让证书在容器重建后仍然复用（不用 -tls 时也可去掉）。
     volumes:
       - webproxy-data:/app
 
