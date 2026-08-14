@@ -263,3 +263,10 @@ docker run -d --name webproxy -p 443:443 -p 80:80 \
   `-upstream-proxy socks5://127.0.0.1:1080`，并通过 SSH 反向隧道
   （`ssh -N -R 1080:127.0.0.1:1080`）把该机器的 SOCKS5 代理映射到服务器上，
   所有上游请求就从干净出口出去了
+- 反代部署在 Caddy / nginx 之后（前级做 SSL 终止 + basic_auth，再
+  `reverse_proxy` 到 webproxy），只有并发请求时上游静态资源（如
+  `auth-cdn.oaistatic.com`）返回 Cloudflare WAF 403：这是前级附加的
+  `Via` / `X-Forwarded-*` 代理链头 + basic_auth 的 `Authorization: Basic` 凭据
+  被透传、触发上游 WAF。v0.1.9 起 webproxy 会自动剥掉这些前级代理链头
+  （保留 `Bearer` 鉴权）并按上游域隔离 cookie，**无需改动前级配置**；
+  升级镜像即可（`docker compose pull && docker compose up -d`）
