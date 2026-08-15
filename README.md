@@ -270,3 +270,9 @@ docker run -d --name webproxy -p 443:443 -p 80:80 \
   被透传、触发上游 WAF。v0.1.9 起 webproxy 会自动剥掉这些前级代理链头
   （保留 `Bearer` 鉴权）并按上游域隔离 cookie，**无需改动前级配置**；
   升级镜像即可（`docker compose pull && docker compose up -d`）
+- 前级 basic_auth 门禁下，登录完成、开始正常使用后浏览器反复弹出原生
+  「用户名/密码」框、输对密码仍不断弹：浏览器只在顶层导航和子资源上
+  附带缓存的 HTTP Basic 认证，**fetch()/XHR 请求不会附带**，于是前级对每条
+  API 请求都返回 `401 WWW-Authenticate`。v0.1.10 起运行时 shim 会回放前级
+  basic_auth 凭据到发往代理域的 fetch/XHR（只回放 `Basic`，不碰 `Bearer`，
+  也不泄漏给直连域），**无需改动前级配置**；升级镜像即可
