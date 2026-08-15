@@ -936,6 +936,11 @@ func TestShimBasicAuthReplay(t *testing.T) {
 		t.Errorf("no-arg shim should default to empty AUTH")
 	}
 
+	// The shim auto-calls /__login to plant the session cookie after basic auth.
+	if !strings.Contains(basic, `fetch("/__login"`) {
+		t.Errorf("shim missing /__login auto-login call")
+	}
+
 	// rewriteHTMLAuth threads the credential into the injected script.
 	html := `<!DOCTYPE html><html><head><title>x</title></head><body>hi</body></html>`
 	out := string(p.rewriteHTMLAuth([]byte(html), p.ownOrigin+"/", "Basic dGVzdDp0ZXN0"))
