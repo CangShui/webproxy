@@ -904,6 +904,46 @@ func TestShimTemplateBalanced(t *testing.T) {
 	}
 }
 
+// TestShimBasicAuthReplay verifies the runtime shim replays the front proxy's
+// HTTP Basic-auth credential (e.g. Caddy basic_auth) on proxied fetch/XHR
+// subrequests, and only for the "Basic" scheme. Browsers do not attach cached
+// HTTP Basic auth to fetch()/XHR, so without this the front proxy would
+// re-challenge every API call after login with a 401 + WWW-Authenticate.
+func TestShimBasicAuthReplay(t *testing.T) {
+	p := testProxy(t)
+
+	basic := p.runtimeShimScriptAuth("Basic dGVzdDp0ZXN0")
+	for _, want := range []string{
+		`var AUTH="Basic dGVzdDp0ZXN0"`,
+		`function wpAuth(u,init,hdr)`,
+		`h.set("Authorization",AUTH)`,
+		`this.__wpur=a[1]`,
+		`this.setRequestHeader("Authorization",AUTH)`,
+	} {
+		if !strings.Contains(basic, want) {
+			t.Errorf("basic shim missing %q", want)
+		}
+	}
+
+	// A Bearer/other scheme must never be replayed onto unrelated requests.
+	bearer := p.runtimeShimScriptAuth("Bearer abc.def")
+	if !strings.Contains(bearer, `var AUTH=""`) {
+		t.Errorf("Bearer auth should be ignored")
+	}
+
+	// The no-arg wrapper defaults to no auth.
+	if plain := p.runtimeShimScript(); !strings.Contains(plain, `var AUTH=""`) {
+		t.Errorf("no-arg shim should default to empty AUTH")
+	}
+
+	// rewriteHTMLAuth threads the credential into the injected script.
+	html := `<!DOCTYPE html><html><head><title>x</title></head><body>hi</body></html>`
+	out := string(p.rewriteHTMLAuth([]byte(html), p.ownOrigin+"/", "Basic dGVzdDp0ZXN0"))
+	if !strings.Contains(out, `var AUTH="Basic dGVzdDp0ZXN0"`) {
+		t.Errorf("rewriteHTMLAuth did not inject basic auth into shim")
+	}
+}
+
 func TestModifyResponseDecompressesGzipForRewrite(t *testing.T) {
 	p := testProxy(t)
 	html := []byte(`<!DOCTYPE html><html><head><title>x</title></head><body><a href="/login">l</a></body></html>`)

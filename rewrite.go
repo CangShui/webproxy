@@ -387,6 +387,12 @@ func uriOf(u *url.URL) string {
 // is the proxied URL of the current document; the page URL and the base href
 // both carry the host prefix, keeping the app's own-origin assumption intact.
 func (p *Proxy) rewriteHTML(body []byte, pageURL string) []byte {
+	return p.rewriteHTMLAuth(body, pageURL, "")
+}
+
+// rewriteHTMLAuth is rewriteHTML with an optional HTTP Basic-auth header that
+// is replayed into the runtime shim (see runtimeShimScript).
+func (p *Proxy) rewriteHTMLAuth(body []byte, pageURL, authHeader string) []byte {
 	pageHost := p.pageHostOf(pageURL)
 	z := html.NewTokenizer(bytes.NewReader(body))
 	var out bytes.Buffer
@@ -413,7 +419,7 @@ func (p *Proxy) rewriteHTML(body []byte, pageURL string) []byte {
 		if !sawBase && pageURL != "" {
 			injected += `<base href="` + html.EscapeString(pageURL) + `">`
 		}
-		injected += `<script>` + p.runtimeShimScript() + `</script>`
+		injected += `<script>` + p.runtimeShimScriptAuth(authHeader) + `</script>`
 		if injected != "" {
 			if headOpenEnd >= 0 {
 				h := head.Bytes()

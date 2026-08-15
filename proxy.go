@@ -25,6 +25,7 @@ type ctxKey int
 const (
 	ctxKeyPageURL ctxKey = iota
 	ctxKeyPrefix
+	ctxKeyAuthHeader
 )
 
 // defaultDirectDomains are third-party hosts that must load straight from
@@ -615,7 +616,7 @@ func (p *Proxy) serveSentinelFrame(w http.ResponseWriter, r *http.Request) {
 	body := []byte("<!DOCTYPE html><html><body><script src='" + src + "'></script></body></html>")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Del("Content-Security-Policy")
-	out := p.rewriteHTML(body, p.pageURL(r))
+	out := p.rewriteHTMLAuth(body, p.pageURL(r), r.Header.Get("Authorization"))
 	w.Header().Set("Content-Length", strconv.Itoa(len(out)))
 	w.WriteHeader(http.StatusOK)
 	w.Write(out)
@@ -623,6 +624,12 @@ func (p *Proxy) serveSentinelFrame(w http.ResponseWriter, r *http.Request) {
 
 func (p *Proxy) serveReverse(w http.ResponseWriter, r *http.Request, target *url.URL, pageURL, pathPrefix string) {
 	director := func(req *http.Request) {
+		// Capture the front proxy's HTTP Basic-auth credential (e.g. Caddy's
+		// basic_auth) before rewriteRequestHeaders strips it. Browsers do not
+		// attach cached HTTP Basic auth to fetch()/XHR subrequests, so the
+		// front proxy would otherwise re-challenge every API call after login.
+		// The runtime shim replays this header on proxied fetch/XHR calls.
+		authHeader := req.Header.Get("Authorization")
 		u := *target
 		if s := p.unrewriteURLParams(u.String()); s != u.String() {
 			if nu, err := url.Parse(s); err == nil {
@@ -668,6 +675,7 @@ func (p *Proxy) serveReverse(w http.ResponseWriter, r *http.Request, target *url
 		p.debugLogf("UPSTREAM %s %s host=%q proto=%s hdrs=%v", req.Method, req.URL.String(), req.Host, req.Proto, req.Header)
 		ctx := context.WithValue(req.Context(), ctxKeyPageURL, pageURL)
 		ctx = context.WithValue(ctx, ctxKeyPrefix, pathPrefix)
+		ctx = context.WithValue(ctx, ctxKeyAuthHeader, authHeader)
 		*req = *req.WithContext(ctx)
 	}
 	rp := &httputil.ReverseProxy{
@@ -756,6 +764,7 @@ func (p *Proxy) modifyResponse(resp *http.Response) {
 	if !isRewritable(ct) {
 		return // non-rewritable payloads pass through untouched (with their encoding)
 	}
+	authHeader, _ := ctxString(resp, ctxKeyAuthHeader)
 	pageURL, _ := ctxString(resp, ctxKeyPageURL)
 	body := resp.Body
 	// Accept-Encoding now passes through, so rewritable content may arrive
@@ -776,7 +785,7 @@ func (p *Proxy) modifyResponse(resp *http.Response) {
 	transform := func(data []byte) []byte {
 		switch {
 		case strings.Contains(ct, "html"):
-			return p.rewriteHTML(data, pageURL)
+			return p.rewriteHTMLAuth(data, pageURL, authHeader)
 		case strings.Contains(ct, "css"):
 			return []byte(p.rewriteCSS(string(data)))
 		default: // javascript / json

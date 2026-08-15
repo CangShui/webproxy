@@ -87,6 +87,17 @@ func (p *Proxy) rewriteAbsParam(v string) string {
 // proxied hosts (and URL-valued query params like redirect_uri) stay on the
 // proxy domain even when the site constructs them dynamically.
 func (p *Proxy) runtimeShimScript() string {
+	return p.runtimeShimScriptAuth("")
+}
+
+// runtimeShimScriptAuth is runtimeShimScript with an optional HTTP Basic-auth
+// header to replay on proxied fetch/XHR calls. Only the "Basic" scheme is
+// replayed; anything else (Bearer tokens etc.) is ignored so the shim never
+// overrides a real Authorization header the app sets itself.
+func (p *Proxy) runtimeShimScriptAuth(authHeader string) string {
+	if !strings.HasPrefix(strings.TrimSpace(authHeader), "Basic ") {
+		authHeader = ""
+	}
 	hosts := []string{p.targetHostname}
 	if p.registrable != "" && p.registrable != p.targetHostname {
 		hosts = append(hosts, p.registrable)
@@ -111,6 +122,7 @@ func (p *Proxy) runtimeShimScript() string {
 	}
 	js := shimTemplate
 	js = strings.ReplaceAll(js, "OWN_PLACEHOLDER", strconv.Quote(p.ownOrigin))
+	js = strings.ReplaceAll(js, "AUTH_PLACEHOLDER", strconv.Quote(authHeader))
 	js = strings.ReplaceAll(js, "ROOT_PLACEHOLDER", strconv.FormatBool(p.cfg.RootSite))
 	js = strings.ReplaceAll(js, "TARGET_PLACEHOLDER", strconv.Quote(p.targetHostname))
 	js = strings.ReplaceAll(js, "HOSTS_PLACEHOLDER", jsArray(uniq))
@@ -135,6 +147,7 @@ const shimTemplate = `(function(){
 var OWN=OWN_PLACEHOLDER;
 var HOSTS=HOSTS_PLACEHOLDER;
 var DIRECT=DIRECT_PLACEHOLDER;var ROOT=ROOT_PLACEHOLDER;var TARGET=TARGET_PLACEHOLDER;
+var AUTH=AUTH_PLACEHOLDER;
 var PARAMS=["redirect_uri","redirect","return_to","return","next","continue","continue_url","callback","callback_url","callbackurl","cancel_url","success_url","post_logout_redirect_uri","logout_uri","login_uri","signup_uri","forward","goto","destination","url","link","target","image","img","src","popup_url"];
 function isDirect(h){h=String(h||"").toLowerCase();for(var j=0;j<DIRECT.length;j++){var d=DIRECT[j];if(h===d||(h.length>d.length&&h.charAt(h.length-d.length-1)==="."&&h.slice(-d.length)===d))return true;}return false;}
 function isKnown(h){h=String(h||"").toLowerCase();var i=h.indexOf(":");if(i>0)h=h.slice(0,i);for(var j=0;j<HOSTS.length;j++){var d=HOSTS[j];if(h===d||(h.length>d.length&&h.charAt(h.length-d.length-1)==="."&&h.slice(-d.length)===d))return true;}return false;}
@@ -153,8 +166,11 @@ try{var L=window.Location&&window.Location.prototype;if(L){var hd=Object.getOwnP
 try{var ow=window.open;window.open=function(){var u=arguments[0];if(typeof u==="string"){var p=proxify(u);var args=Array.prototype.slice.call(arguments);args[0]=p;return ow.apply(window,args);}return ow.apply(window,arguments);};}catch(e){}
 try{var la=window.location.assign?window.location.assign.bind(window.location):null;if(la){window.location.assign=function(u){return la(proxify(u));};}}catch(e){}
 try{var lr=window.location.replace?window.location.replace.bind(window.location):null;if(lr){window.location.replace=function(u){return lr(proxify(u));};}}catch(e){}
-try{var of=window.fetch;window.fetch=function(input,init){if(typeof input==="string"){return of.call(window,proxify(input),init);}if(input&&input.url&&typeof input.url==="string"){var p=proxify(input.url);if(p!==input.url){return of.call(window,new Request(p,input),init);}}return of.call(window,input,init);};}catch(e){}
-try{var xo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(){var a=Array.prototype.slice.call(arguments);if(a.length>1&&typeof a[1]==="string"){a[1]=proxify(a[1]);}return xo.apply(this,a);};}catch(e){}
+function wpAuth(u,init,hdr){if(!AUTH)return init;try{var x=new URL(u,base());if(x.hostname!==ownHost())return init;var h=new Headers(init&&init.headers?init.headers:{});if(h.has("Authorization")||(hdr&&hdr.has&&hdr.has("Authorization")))return init;h.set("Authorization",AUTH);var o={};if(init){for(var k in init){if(Object.prototype.hasOwnProperty.call(init,k)&&k!=="headers")o[k]=init[k];}}o.headers=h;return o;}catch(e){return init;}}
+try{var of=window.fetch;window.fetch=function(input,init){if(typeof input==="string"){var u=proxify(input);return of.call(window,u,wpAuth(u,init));}if(input&&input.url&&typeof input.url==="string"){var p=proxify(input.url);if(p!==input.url){return of.call(window,new Request(p,input),wpAuth(p,init,input.headers));}return of.call(window,input,wpAuth(input.url,init,input.headers));}return of.call(window,input,init);};}catch(e){}
+try{var xo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(){var a=Array.prototype.slice.call(arguments);if(a.length>1&&typeof a[1]==="string"){a[1]=proxify(a[1]);}try{this.__wpur=a[1];}catch(e){}return xo.apply(this,a);};}catch(e){}
+try{var xsr=XMLHttpRequest.prototype.setRequestHeader;XMLHttpRequest.prototype.setRequestHeader=function(n,v){try{if(String(n).toLowerCase()==="authorization")this.__wpau=1;}catch(e){}return xsr.apply(this,arguments);};}catch(e){}
+try{var xs=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.send=function(){try{if(AUTH&&this.__wpur&&!this.__wpau){var x=new URL(this.__wpur,base());if(x.hostname===ownHost())this.setRequestHeader("Authorization",AUTH);}}catch(e){}return xs.apply(this,arguments);};}catch(e){}
 try{var ap=HTMLAnchorElement.prototype;var ahd=Object.getOwnPropertyDescriptor(ap,"href");if(ahd&&ahd.set){Object.defineProperty(ap,"href",{get:ahd.get,set:function(v){ahd.set.call(this,proxify(v));},configurable:true});}}catch(e){}
 try{var ip=HTMLIFrameElement.prototype;var isd=Object.getOwnPropertyDescriptor(ip,"src");if(isd&&isd.set){Object.defineProperty(ip,"src",{get:isd.get,set:function(v){isd.set.call(this,proxify(v));},configurable:true});}}catch(e){}
 try{var sp=HTMLScriptElement.prototype;var ssd=Object.getOwnPropertyDescriptor(sp,"src");if(ssd&&ssd.set){Object.defineProperty(sp,"src",{get:ssd.get,set:function(v){ssd.set.call(this,proxify(v));},configurable:true});}}catch(e){}
